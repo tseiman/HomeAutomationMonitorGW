@@ -14,17 +14,17 @@ func TestIndicatorExtendsShortActivityToMinimumHold(t *testing.T) {
 	base := time.Unix(100, 0)
 	indicator := newIndicator(750 * time.Millisecond)
 
-	if color, _ := indicator.observe(statusInput{connected: true, active: true}, base); color != colorGreen {
-		t.Fatalf("active color=%v, want green", color)
+	if color, _ := indicator.observe(statusInput{connected: true, active: true}, base); color != colorOrange {
+		t.Fatalf("active color=%v, want yellow/orange", color)
 	}
-	if color, next := indicator.observe(statusInput{connected: true}, base.Add(20*time.Millisecond)); color != colorGreen || !next.Equal(base.Add(750*time.Millisecond)) {
-		t.Fatalf("short idle transition color=%v next=%v, want green until %v", color, next, base.Add(750*time.Millisecond))
+	if color, next := indicator.observe(statusInput{connected: true}, base.Add(20*time.Millisecond)); color != colorOrange || !next.Equal(base.Add(750*time.Millisecond)) {
+		t.Fatalf("short idle transition color=%v next=%v, want yellow/orange until %v", color, next, base.Add(750*time.Millisecond))
 	}
-	if color, next := indicator.observe(statusInput{connected: true}, base.Add(749*time.Millisecond)); color != colorGreen || next.IsZero() {
-		t.Fatalf("held activity color=%v next=%v, want green with pending transition", color, next)
+	if color, next := indicator.observe(statusInput{connected: true}, base.Add(749*time.Millisecond)); color != colorOrange || next.IsZero() {
+		t.Fatalf("held activity color=%v next=%v, want yellow/orange with pending transition", color, next)
 	}
-	if color, next := indicator.observe(statusInput{connected: true}, base.Add(750*time.Millisecond)); color != colorOff || !next.IsZero() {
-		t.Fatalf("expired activity color=%v next=%v, want off without transition", color, next)
+	if color, next := indicator.observe(statusInput{connected: true}, base.Add(750*time.Millisecond)); color != colorGreen || !next.IsZero() {
+		t.Fatalf("expired activity color=%v next=%v, want healthy green without transition", color, next)
 	}
 }
 
@@ -33,15 +33,15 @@ func TestIndicatorPriorityOverridesActivityHold(t *testing.T) {
 	indicator := newIndicator(time.Second)
 	indicator.observe(statusInput{connected: true, active: true}, base)
 
-	if color, _ := indicator.observe(statusInput{connected: true, healthCode: 1}, base.Add(10*time.Millisecond)); color != colorOrange {
-		t.Fatalf("degraded color=%v, want orange", color)
+	if color, _ := indicator.observe(statusInput{connected: true, healthCode: 1, active: true}, base.Add(10*time.Millisecond)); color != colorRed {
+		t.Fatalf("degraded color=%v, want red", color)
 	}
 	indicator.observe(statusInput{connected: true, active: true}, base.Add(20*time.Millisecond))
-	if color, _ := indicator.observe(statusInput{}, base.Add(30*time.Millisecond)); color != colorRed {
-		t.Fatalf("disconnected color=%v, want red", color)
+	if color, _ := indicator.observe(statusInput{}, base.Add(30*time.Millisecond)); color != colorOff {
+		t.Fatalf("disconnected color=%v, want off", color)
 	}
-	if color, _ := indicator.observe(statusInput{connected: true}, base.Add(40*time.Millisecond)); color != colorOff {
-		t.Fatalf("recovered idle color=%v, want off after hold was cancelled", color)
+	if color, _ := indicator.observe(statusInput{connected: true}, base.Add(40*time.Millisecond)); color != colorGreen {
+		t.Fatalf("recovered idle color=%v, want green after hold was cancelled", color)
 	}
 }
 

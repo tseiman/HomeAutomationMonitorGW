@@ -4,14 +4,14 @@
 
 ## State mapping
 
-The selected LED (`A1` or `A2`) uses this priority:
+The selected LED (`A1` or `A2`) uses this mapping:
 
-1. **Red** — the HTTPS/SSE connection is unavailable, closes, or sends no bytes before `stream_timeout`.
-2. **Orange** — the gateway is reachable and reports collector health code `1` (degraded) or `2` (failed).
-3. **Green** — at least one collector is active.
-4. **Off** — the gateway is reachable, healthy, and idle.
+1. **Green** — the gateway is reachable, healthy, and idle.
+2. **Yellow** — at least one collector is active. This is the combined red/green (`orange`) RevPiLED value.
+3. **Red** — the gateway is reachable and reports collector health code `1` (degraded) or `2` (failed).
+4. **Off** — the HTTPS/SSE connection is unavailable, closes, or sends no bytes before `stream_timeout`.
 
-Errors and disconnects override green immediately. Collector polls can be shorter than a visible flash, so green remains on for at least `activity_hold` after activity begins. The default is `750ms`; a later active event extends the hold. If the gateway coalesces a complete short poll before the client reads both edges, a changed `activity.poll_sequence` still creates the green pulse. The client preserves the two bits belonging to the unselected LED.
+Health errors override yellow activity immediately; a disconnect turns the selected LED off. Collector polls can be shorter than a visible flash, so yellow remains on for at least `activity_hold` after activity begins. The default is `750ms`; a later active event extends the hold. If the gateway coalesces a complete short poll before the client reads both edges, a changed `activity.poll_sequence` still creates the yellow pulse. The client preserves the two bits belonging to the unselected LED.
 
 ## Hardware access
 
@@ -132,7 +132,7 @@ See [`config.example.yaml`](config.example.yaml). Important fields:
 - `token_file`: absolute path with no access for “other” users;
 - `ca_file`: optional private CA PEM; system roots remain enabled;
 - `led`: `A1` or `A2`;
-- `activity_hold`: minimum visible green duration, default `750ms`;
+- `activity_hold`: minimum visible yellow activity duration, default `750ms`;
 - `stream_timeout`: no-byte timeout, default `45s` and required to exceed 15 seconds;
 - `reconnect_min` / `reconnect_max`: exponential reconnect range.
 

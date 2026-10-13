@@ -38,24 +38,24 @@ func newIndicator(activityHold time.Duration) *indicator {
 func (i *indicator) observe(input statusInput, now time.Time) (ledColor, time.Time) {
 	if !input.connected {
 		i.activityUntil = time.Time{}
-		return colorRed, time.Time{}
+		return colorOff, time.Time{}
 	}
 	if input.healthCode > 0 {
 		i.activityUntil = time.Time{}
-		return colorOrange, time.Time{}
+		return colorRed, time.Time{}
 	}
 	if input.active {
 		until := now.Add(i.activityHold)
 		if until.After(i.activityUntil) {
 			i.activityUntil = until
 		}
-		return colorGreen, time.Time{}
+		return colorOrange, time.Time{}
 	}
 	if now.Before(i.activityUntil) {
-		return colorGreen, i.activityUntil
+		return colorOrange, i.activityUntil
 	}
 	i.activityUntil = time.Time{}
-	return colorOff, time.Time{}
+	return colorGreen, time.Time{}
 }
 
 func mergeLEDColor(current byte, led string, color ledColor) (byte, error) {

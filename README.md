@@ -588,7 +588,7 @@ data: {"schema_version":1,"sequence":42,"service":"running",...}
 
 The `sequence` and `activity.poll_sequence` values increase monotonically within one runtime generation. A successful configuration reload intentionally closes existing streams so clients reconnect, authenticate against the new policy, and receive a new complete snapshot. Intermediate notifications are coalesced for slow clients; the latest snapshot always contains the authoritative current state, while a changed `activity.poll_sequence` records that one or more polls started between snapshots. The gateway accepts at most eight simultaneous status streams.
 
-Heartbeats are emitted every 15 seconds. A stopped or unreachable process cannot send a final event, so a RevPi client must treat a failed connection, an EOF, or 45 seconds without any status event or heartbeat as `not reachable`, then reconnect with backoff. The optional RevPi client uses `activity.poll_sequence` to recover coalesced short polls and keeps green visible for `750ms` by default; the gateway itself reports activity without presentation delays.
+Heartbeats are emitted every 15 seconds. A stopped or unreachable process cannot send a final event, so a RevPi client must treat a failed connection, an EOF, or 45 seconds without any status event or heartbeat as `not reachable`, then reconnect with backoff. The optional RevPi client uses `activity.poll_sequence` to recover coalesced short polls and keeps its yellow activity indication visible for `750ms` by default; the gateway itself reports activity without presentation delays.
 
 Use a dedicated RevPi token file and add the RevPi's actual source address to `authentication.allowed_clients`. To inspect the snapshot and stream manually without placing a real credential in documentation:
 
@@ -602,7 +602,7 @@ curl --fail --no-buffer \
   https://gateway.example/api/v1/status/events
 ```
 
-For a single multi-color LED, use the priority `not reachable > health error/degraded > activity > healthy idle`. Multiple LEDs can display health and activity independently.
+The optional single-LED client displays `healthy idle = green`, `activity = yellow`, `health error/degraded = red`, and `not reachable = off`. Health errors override simultaneous activity. Multiple LEDs can display health and activity independently.
 
 Import [`zabbix/template_homeauthmonitorgw.yaml`](zabbix/template_homeauthmonitorgw.yaml), set `{$AUTOMATION_GATEWAY_URL}`, secret `{$AUTOMATION_GATEWAY_TOKEN}`, `{$AUTOMATION_GATEWAY_INTERVAL}`, and `{$AUTOMATION_GATEWAY_TIMEOUT}`, and keep certificate verification enabled. Add the Zabbix server/proxy's actual TCP source address to `authentication.allowed_clients`. The template uses one HTTP master item and dependent discovery/items; it never contacts NUT or SNMP devices directly.
 
