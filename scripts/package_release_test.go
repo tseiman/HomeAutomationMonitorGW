@@ -64,13 +64,13 @@ func TestPackageReleaseBuildsMinimalLinuxBundle(t *testing.T) {
 
 	gotEntries := tarGzipEntries(t, archivePath)
 	wantEntries := []string{
-		"INSTALL.txt",
-		"LICENSE",
-		binaryName,
-		"configs/config.example.yaml",
-		"configs/mib-metadata.example.json",
-		"scripts/install.sh",
-		"systemd/automation-gateway.service",
+		"automation-gateway/INSTALL.txt",
+		"automation-gateway/LICENSE",
+		"automation-gateway/" + binaryName,
+		"automation-gateway/configs/config.example.yaml",
+		"automation-gateway/configs/mib-metadata.example.json",
+		"automation-gateway/scripts/install.sh",
+		"automation-gateway/systemd/automation-gateway.service",
 	}
 	sort.Strings(wantEntries)
 	if strings.Join(gotEntries, "\n") != strings.Join(wantEntries, "\n") {
@@ -79,13 +79,13 @@ func TestPackageReleaseBuildsMinimalLinuxBundle(t *testing.T) {
 
 	gotLEDEntries := tarGzipEntries(t, ledArchivePath)
 	wantLEDEntries := []string{
-		"LICENSE",
-		"README.md",
-		"THIRD_PARTY_LICENSES.md",
-		ledBinaryName,
-		"config.example.yaml",
-		"install.sh",
-		"systemd/automation-gateway-led.service",
+		"automation-gateway-led/LICENSE",
+		"automation-gateway-led/README.md",
+		"automation-gateway-led/THIRD_PARTY_LICENSES.md",
+		"automation-gateway-led/" + ledBinaryName,
+		"automation-gateway-led/config.example.yaml",
+		"automation-gateway-led/install.sh",
+		"automation-gateway-led/systemd/automation-gateway-led.service",
 	}
 	sort.Strings(wantLEDEntries)
 	if strings.Join(gotLEDEntries, "\n") != strings.Join(wantLEDEntries, "\n") {

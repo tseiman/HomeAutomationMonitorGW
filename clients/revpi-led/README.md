@@ -112,7 +112,7 @@ The installer preserves an existing configuration and token. Without `--start`, 
 
 ## Install from a release archive
 
-The project release script creates a separate optional archive and checksum for the LED client. It is not placed inside the normal gateway archive.
+The project release script creates a separate optional archive and checksum for the LED client. It is not placed inside the normal gateway archive. The archive has one top-level `automation-gateway-led/` directory, so it can be extracted beside the gateway archive without mixing their files.
 
 ```bash
 ARCHIVE="automation-gateway-led-VERSION-linux-armv7.tar.gz"
@@ -133,8 +133,8 @@ After a successful checksum verification:
 ```bash
 INSTALL_DIR="$(mktemp -d /tmp/automation-gateway-led-install.XXXXXX)"
 tar -xzf "$ARCHIVE" -C "$INSTALL_DIR"
-cd "$INSTALL_DIR"
-sudo ./install.sh --binary="$INSTALL_DIR/automation-gateway-led-linux-armv7"
+cd "$INSTALL_DIR/automation-gateway-led"
+sudo ./install.sh --binary="$INSTALL_DIR/automation-gateway-led/automation-gateway-led-linux-armv7"
 ```
 
 Configure and start it only after validating the concrete RevPi hardware as described above.

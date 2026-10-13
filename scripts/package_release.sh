@@ -572,18 +572,20 @@ write_sha256 "$LED_BINARY_PATH"
 log "created $LED_BINARY_NAME"
 
 STAGE_DIR="$(mktemp -d "${PACKAGE_TMPDIR:-/tmp}/automation-gateway.linux-stage.XXXXXX")"
-copy_linux_material "$LINUX_BINARY_PATH" "$STAGE_DIR"
+install -d -m 0755 "$STAGE_DIR/automation-gateway"
+copy_linux_material "$LINUX_BINARY_PATH" "$STAGE_DIR/automation-gateway"
 LINUX_ARCHIVE="$OUTPUT_DIR/automation-gateway-${FILENAME_VERSION}-linux-${ARCH_LABEL}.tar.gz"
 rm -f "$LINUX_ARCHIVE"
-tar -C "$STAGE_DIR" -czf "$LINUX_ARCHIVE" .
+tar -C "$STAGE_DIR" -czf "$LINUX_ARCHIVE" automation-gateway
 write_sha256 "$LINUX_ARCHIVE"
 log "created $(basename "$LINUX_ARCHIVE")"
 
 LED_STAGE_DIR="$(mktemp -d "${PACKAGE_TMPDIR:-/tmp}/automation-gateway-led.linux-stage.XXXXXX")"
-copy_led_material "$LED_BINARY_PATH" "$LED_STAGE_DIR"
+install -d -m 0755 "$LED_STAGE_DIR/automation-gateway-led"
+copy_led_material "$LED_BINARY_PATH" "$LED_STAGE_DIR/automation-gateway-led"
 LED_ARCHIVE="$OUTPUT_DIR/automation-gateway-led-${FILENAME_VERSION}-linux-${ARCH_LABEL}.tar.gz"
 rm -f "$LED_ARCHIVE"
-tar -C "$LED_STAGE_DIR" -czf "$LED_ARCHIVE" .
+tar -C "$LED_STAGE_DIR" -czf "$LED_ARCHIVE" automation-gateway-led
 write_sha256 "$LED_ARCHIVE"
 log "created $(basename "$LED_ARCHIVE")"
 

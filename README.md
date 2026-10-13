@@ -208,17 +208,19 @@ automation-gateway-led-<SHORT-GIT-HASH>-linux-arm64.tar.gz
 automation-gateway-led-<SHORT-GIT-HASH>-linux-arm64.tar.gz.sha256
 ```
 
-The raw binary and both portable SHA-256 files contain only relative filenames. The `tar.gz` contains exactly the runtime installation material—no Go source tree:
+The raw binary and both portable SHA-256 files contain only relative filenames. The gateway `tar.gz` contains exactly one top-level `automation-gateway/` directory with the runtime installation material—no Go source tree:
 
 ```text
-INSTALL.txt
-LICENSE
-automation-gateway-linux-arm64
-configs/config.example.yaml
-configs/mib-metadata.example.json
-scripts/install.sh
-systemd/automation-gateway.service
+automation-gateway/INSTALL.txt
+automation-gateway/LICENSE
+automation-gateway/automation-gateway-linux-arm64
+automation-gateway/configs/config.example.yaml
+automation-gateway/configs/mib-metadata.example.json
+automation-gateway/scripts/install.sh
+automation-gateway/systemd/automation-gateway.service
 ```
+
+The optional LED archive likewise has one top-level `automation-gateway-led/` directory. Both archives can therefore be extracted into the same parent directory without mixing files.
 
 Temporary staging remains under `/tmp` by default and is removed automatically. Generated release files in the project root are ignored by Git.
 
@@ -310,18 +312,20 @@ Only after successful verification:
 ```bash
 INSTALL_DIR="$(mktemp -d /tmp/HomeAutomationMonitorGW-install.XXXXXX)"
 tar -xzf "$ARCHIVE" -C "$INSTALL_DIR"
-cd "$INSTALL_DIR"
+cd "$INSTALL_DIR/automation-gateway"
 
 test -x "./$BINARY"
 test -x ./scripts/install.sh
 file "./$BINARY"
-sudo ./scripts/install.sh --binary="$INSTALL_DIR/$BINARY"
+sudo ./scripts/install.sh --binary="$INSTALL_DIR/automation-gateway/$BINARY"
 ```
 
 With `--binary`, the target does not need Go and does not download modules. Existing site-owned configuration, tokens, secrets, and TLS files are preserved. On a first installation with incomplete configuration or missing credentials, the installer intentionally leaves the service inactive. Finish provisioning and then run:
 
 ```bash
-sudo ./scripts/install.sh --binary="$INSTALL_DIR/$BINARY" --start
+sudo "$INSTALL_DIR/automation-gateway/scripts/install.sh" \
+  --binary="$INSTALL_DIR/automation-gateway/$BINARY" \
+  --start
 ```
 
 For an already configured and active installation, a changed binary is installed and the active service is restarted. After a successful installation, remove only the temporary transfer material:
