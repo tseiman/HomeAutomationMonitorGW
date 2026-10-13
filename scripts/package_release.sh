@@ -151,7 +151,10 @@ HomeAutomationMonitorGW $VERSION for Linux $ARCH_LABEL
 Verify the adjacent release checksum before extracting this archive.
 From the extracted directory install the prebuilt binary with:
 
-  sudo ./scripts/install.sh --binary=./$LINUX_BINARY_NAME
+  sudo ./scripts/install.sh
+
+The release installer detects the adjacent $LINUX_BINARY_NAME automatically;
+Go is not required on the target. --binary remains available as an explicit override.
 
 On a first installation, configure /etc/automation-gateway and provision the
 site-owned token and TLS files before starting the service. Existing site-owned

@@ -317,14 +317,13 @@ cd "$INSTALL_DIR/automation-gateway"
 test -x "./$BINARY"
 test -x ./scripts/install.sh
 file "./$BINARY"
-sudo ./scripts/install.sh --binary="$INSTALL_DIR/automation-gateway/$BINARY"
+sudo ./scripts/install.sh
 ```
 
-With `--binary`, the target does not need Go and does not download modules. Existing site-owned configuration, tokens, secrets, and TLS files are preserved. On a first installation with incomplete configuration or missing credentials, the installer intentionally leaves the service inactive. Finish provisioning and then run:
+Inside the release archive, the installer detects the adjacent prebuilt `automation-gateway-linux-<arch>` binary automatically. The target does not need Go and does not download modules. `--binary=PATH` remains available as an explicit override. Existing site-owned configuration, tokens, secrets, and TLS files are preserved. On a first installation with incomplete configuration or missing credentials, the installer intentionally leaves the service inactive. Finish provisioning and then run:
 
 ```bash
 sudo "$INSTALL_DIR/automation-gateway/scripts/install.sh" \
-  --binary="$INSTALL_DIR/automation-gateway/$BINARY" \
   --start
 ```
 

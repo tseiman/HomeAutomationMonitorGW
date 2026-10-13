@@ -144,6 +144,47 @@ func TestRootInvocationBuildsWithoutVerification(t *testing.T) {
 	}
 }
 
+// TestReleaseArchiveUsesBundledBinaryWithoutGo proves an extracted release does not fall back to a source build.
+func TestReleaseArchiveUsesBundledBinaryWithoutGo(t *testing.T) {
+	projectRoot := projectRoot(t)
+	archiveRoot := t.TempDir()
+	testRoot := t.TempDir()
+	fakeBinDir := filepath.Join(t.TempDir(), "bin")
+	stateDir := filepath.Join(t.TempDir(), "state")
+	for _, directory := range []string{fakeBinDir, stateDir, filepath.Join(archiveRoot, "scripts"), filepath.Join(archiveRoot, "configs"), filepath.Join(archiveRoot, "systemd")} {
+		mustMkdirAll(t, directory)
+	}
+	writeFakeSystemTools(t, fakeBinDir)
+	mustWriteFile(t, filepath.Join(fakeBinDir, "go"), "#!/bin/sh\n: > \"${HOMEAUTH_INSTALL_TEST_STATE:?}/go-invoked\"\nexit 97\n", 0o755)
+	mustCopyFile(t, filepath.Join(projectRoot, "scripts/install.sh"), filepath.Join(archiveRoot, "scripts/install.sh"), 0o755)
+	mustCopyFile(t, filepath.Join(projectRoot, "configs/config.example.yaml"), filepath.Join(archiveRoot, "configs/config.example.yaml"), 0o644)
+	mustCopyFile(t, filepath.Join(projectRoot, "configs/mib-metadata.example.json"), filepath.Join(archiveRoot, "configs/mib-metadata.example.json"), 0o644)
+	mustCopyFile(t, filepath.Join(projectRoot, "systemd/automation-gateway.service"), filepath.Join(archiveRoot, "systemd/automation-gateway.service"), 0o644)
+	mustWriteFile(t, filepath.Join(archiveRoot, "INSTALL.txt"), "release archive\n", 0o644)
+	candidate := writeCandidate(t, t.TempDir(), "archive-prebuilt")
+	mustCopyFile(t, candidate, filepath.Join(archiveRoot, "automation-gateway-linux-arm64"), 0o755)
+	mustWriteFile(t, filepath.Join(testRoot, ".homeauth-install-test-root"), "isolated installer test root\n", 0o600)
+
+	cmd := exec.Command("bash", filepath.Join(archiveRoot, "scripts/install.sh"))
+	cmd.Env = append(os.Environ(),
+		"HOMEAUTH_INSTALL_TESTING=1",
+		"HOMEAUTH_INSTALL_TEST_ROOT="+testRoot,
+		"HOMEAUTH_INSTALL_TEST_STATE="+stateDir,
+		"PATH="+fakeBinDir+":"+os.Getenv("PATH"),
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("release archive installer failed without --binary: %v\n%s", err, output)
+	}
+	assertContains(t, filepath.Join(testRoot, "usr/local/sbin/automation-gateway"), "VERSION=archive-prebuilt")
+	if !strings.Contains(string(output), "using bundled release binary") {
+		t.Fatalf("installer did not report bundled binary selection:\n%s", output)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "go-invoked")); !os.IsNotExist(err) {
+		t.Fatalf("release archive installer invoked Go: %v\n%s", err, output)
+	}
+}
+
 // TestInstallerRejectsConfigurationSymlink proves a site file cannot redirect a privileged write.
 func TestInstallerRejectsConfigurationSymlink(t *testing.T) {
 	projectRoot := projectRoot(t)

@@ -30,8 +30,9 @@ usage() {
     cat <<'USAGE'
 Usage: ./scripts/install.sh [--binary=PATH] [--start] [--verify] [--verbose]
 
-Without --binary, the script downloads modules and builds the current checkout,
-including local changes. Tests and vet run only when --verify is requested.
+Inside an extracted release archive, the bundled binary is selected automatically.
+In a source checkout, omitting --binary downloads modules and builds the current
+checkout, including local changes. Tests and vet run only with --verify.
 
 Options:
   --binary=PATH  Install an already built binary instead of building locally.
@@ -236,6 +237,29 @@ ensure_identity() {
         adduser --system --ingroup "$SERVICE_GROUP" --no-create-home --home /nonexistent --shell /usr/sbin/nologin "$SERVICE_USER"
         log "created system user $SERVICE_USER"
     fi
+}
+
+select_bundled_release_binary() {
+    local candidate
+    local -a candidates=()
+
+    # A source checkout always contains go.mod. INSTALL.txt exists only in the
+    # generated portable archive and prevents stale build outputs in a checkout
+    # from being selected implicitly.
+    [[ ! -e "$PROJECT_ROOT/go.mod" ]] || return 1
+    [[ -f "$PROJECT_ROOT/INSTALL.txt" && ! -L "$PROJECT_ROOT/INSTALL.txt" ]] || return 1
+
+    shopt -s nullglob
+    for candidate in "$PROJECT_ROOT"/automation-gateway-linux-*; do
+        if [[ -f "$candidate" && ! -L "$candidate" && -x "$candidate" ]]; then
+            candidates+=("$candidate")
+        fi
+    done
+    shopt -u nullglob
+
+    ((${#candidates[@]} == 1)) || die "release archive must contain exactly one executable automation-gateway-linux-* binary; found ${#candidates[@]}"
+    SOURCE_BINARY="$(readlink -f -- "${candidates[0]}")"
+    log "using bundled release binary $SOURCE_BINARY"
 }
 
 build_binary() {
@@ -536,7 +560,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$SOURCE_BINARY" ]]; then
-    build_binary
+    if ! select_bundled_release_binary; then
+        build_binary
+    fi
 fi
 
 SOURCE_BINARY="$(readlink -f -- "$SOURCE_BINARY")"
