@@ -12,7 +12,8 @@ authentication:
   # One to 32 protected token files and one to 128 client addresses/networks are required.
   bearer_token_files:
     - "/etc/automation-gateway/tokens/zabbix"
-    - "/etc/automation-gateway/tokens/maintenance"
+    - "/etc/automation-gateway/tokens/revpi-status"
+  # Include the actual TCP source addresses of Zabbix and status/SSE clients.
   # CIDR entries must be canonical networks without host bits.
   allowed_clients:
     - "192.168.2.232"

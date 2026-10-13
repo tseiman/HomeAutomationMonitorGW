@@ -20,6 +20,14 @@ import (
 
 type fakeCollector struct{ calls int }
 
+type recordingPollObserver struct {
+	started  chan string
+	finished chan string
+}
+
+func (o *recordingPollObserver) PollStarted(name string)  { o.started <- name }
+func (o *recordingPollObserver) PollFinished(name string) { o.finished <- name }
+
 // Poll increments the fake call count, returns one successful metric initially, and returns an error on later calls.
 func (f *fakeCollector) Poll(context.Context) ([]metrics.Metric, error) {
 	f.calls++
@@ -38,7 +46,7 @@ func TestRunnerPollsImmediatelyAndContainsFailure(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { Run(ctx, "source", 10*time.Millisecond, f, store, logger); close(done) }()
+	go func() { Run(ctx, "source", 10*time.Millisecond, f, store, logger, nil); close(done) }()
 	time.Sleep(25 * time.Millisecond)
 	cancel()
 	<-done
@@ -52,4 +60,30 @@ func TestRunnerPollsImmediatelyAndContainsFailure(t *testing.T) {
 			t.Fatalf("missing %q in logs:\n%s", expected, text)
 		}
 	}
+}
+
+// TestRunnerReportsActivityAroundPoll verifies activity begins before collection and ends after cache publication.
+func TestRunnerReportsActivityAroundPoll(t *testing.T) {
+	store := cache.New(time.Now)
+	store.Register("source", "fake", time.Minute)
+	observer := &recordingPollObserver{started: make(chan string, 1), finished: make(chan string, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		Run(ctx, "source", time.Hour, &fakeCollector{}, store, nil, observer)
+		close(done)
+	}()
+
+	if name := <-observer.started; name != "source" {
+		t.Fatalf("started source=%q", name)
+	}
+	if name := <-observer.finished; name != "source" {
+		t.Fatalf("finished source=%q", name)
+	}
+	got, _ := store.Snapshot("source")
+	if !got.Available || got.LastSuccess.IsZero() {
+		t.Fatalf("finish preceded cache publication: %+v", got)
+	}
+	cancel()
+	<-done
 }

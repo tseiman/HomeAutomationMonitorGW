@@ -9,25 +9,31 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/cache"
+	statusmodel "github.com/tseiman/HomeAutomationMonitorGW/internal/status"
 )
 
 // Options controls static API metadata.
 type Options struct {
-	Version string
-	Logger  *slog.Logger
+	Version           string
+	Logger            *slog.Logger
+	HeartbeatInterval time.Duration
 }
 
 // View is one coherent cache and authorization-policy generation.
 type View struct {
 	Store               *cache.Store
+	Status              *statusmodel.Hub
 	TokenDigests        [][sha256.Size]byte
 	AllowedClients      []netip.Prefix
 	CertificateNotAfter time.Time
@@ -44,6 +50,9 @@ type API struct {
 
 // New returns a cache-only HTTP handler that obtains one current runtime generation per request.
 func New(view ViewProvider, options Options) http.Handler {
+	if options.HeartbeatInterval <= 0 {
+		options.HeartbeatInterval = 15 * time.Second
+	}
 	api := &API{view: view, options: options}
 	handler := http.Handler(http.HandlerFunc(api.serve))
 	if options.Logger != nil {
@@ -127,6 +136,12 @@ func (a *API) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	case "/api/v1/metrics":
 		a.allMetrics(w, view.Store)
+		return
+	case "/api/v1/status":
+		a.status(w, view.Status)
+		return
+	case "/api/v1/status/events":
+		a.statusEvents(w, r, view.Status)
 		return
 	}
 	const prefix = "/api/v1/sources/"
@@ -268,6 +283,86 @@ func (a *API) allMetrics(w http.ResponseWriter, store *cache.Store) {
 		out[snapshot.Name] = snapshot
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// status writes the current canonical gateway and collector activity snapshot.
+func (a *API) status(w http.ResponseWriter, hub *statusmodel.Hub) {
+	if hub == nil {
+		writeError(w, http.StatusServiceUnavailable, "status unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, hub.Snapshot())
+}
+
+// statusEvents streams complete status snapshots on every coalesced change and emits keepalive heartbeats.
+func (a *API) statusEvents(w http.ResponseWriter, r *http.Request, hub *statusmodel.Hub) {
+	if hub == nil {
+		writeError(w, http.StatusServiceUnavailable, "status unavailable")
+		return
+	}
+	changes, unsubscribe, err := hub.Subscribe()
+	if err != nil {
+		if errors.Is(err, statusmodel.ErrTooManySubscribers) {
+			writeError(w, http.StatusServiceUnavailable, "too many status streams")
+			return
+		}
+		writeError(w, http.StatusServiceUnavailable, "status unavailable")
+		return
+	}
+	defer unsubscribe()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	controller := http.NewResponseController(w)
+	if err := writeStatusEvent(w, controller, hub.Snapshot()); err != nil {
+		return
+	}
+
+	heartbeat := time.NewTicker(a.options.HeartbeatInterval)
+	defer heartbeat.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case _, open := <-changes:
+			if !open {
+				return
+			}
+			if err := writeStatusEvent(w, controller, hub.Snapshot()); err != nil {
+				return
+			}
+		case <-heartbeat.C:
+			if err := prepareStreamWrite(controller); err != nil {
+				return
+			}
+			if _, err := fmt.Fprint(w, ": heartbeat\n\n"); err != nil {
+				return
+			}
+			if err := controller.Flush(); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func writeStatusEvent(w http.ResponseWriter, controller *http.ResponseController, snapshot statusmodel.Snapshot) error {
+	body, err := json.Marshal(snapshot)
+	if err != nil {
+		return err
+	}
+	if err := prepareStreamWrite(controller); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "id: %s\nevent: status\ndata: %s\n\n", strconv.FormatUint(snapshot.Sequence, 10), body); err != nil {
+		return err
+	}
+	return controller.Flush()
+}
+
+func prepareStreamWrite(controller *http.ResponseController) error {
+	return controller.SetWriteDeadline(time.Now().Add(5 * time.Second))
 }
 
 // writeJSON sends code and JSON-encodes value; encoding errors cannot be returned after headers commit.

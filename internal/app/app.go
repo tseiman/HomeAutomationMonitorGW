@@ -23,6 +23,7 @@ import (
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/drivers"
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/drivers/nut"
 	snmpdriver "github.com/tseiman/HomeAutomationMonitorGW/internal/drivers/snmp"
+	statusmodel "github.com/tseiman/HomeAutomationMonitorGW/internal/status"
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/tlsreload"
 )
 
@@ -44,6 +45,7 @@ type generation struct {
 	cfg            config.Config
 	cert           *tls.Certificate
 	store          *cache.Store
+	status         *statusmodel.Hub
 	tokenDigests   [][sha256.Size]byte
 	allowedClients []netip.Prefix
 	identities     map[string][sha256.Size]byte
@@ -52,6 +54,7 @@ type generation struct {
 // RuntimeView is one coherent cache and authorization-policy generation for an HTTP request.
 type RuntimeView struct {
 	Store               *cache.Store
+	Status              *statusmodel.Hub
 	TokenDigests        [][sha256.Size]byte
 	AllowedClients      []netip.Prefix
 	CertificateNotAfter time.Time
@@ -95,7 +98,7 @@ func NewFiles(paths []string, logger *slog.Logger) (*Runtime, error) {
 	runtime := &Runtime{paths: append([]string(nil), paths...), logger: logger}
 	active := buildGeneration(cand.cfg, cand.cert, cand.specs, nil)
 	runtime.active.Store(active)
-	runtime.start(cand.specs, active.store)
+	runtime.start(cand.specs, active.store, active.status)
 	return runtime, nil
 }
 
@@ -183,8 +186,9 @@ func buildGeneration(cfg config.Config, cert *tls.Certificate, specs []sourceSpe
 	for index, token := range cfg.Secrets.BearerTokens {
 		digests[index] = sha256.Sum256([]byte(token))
 	}
+	statusHub := statusmodel.New(store, time.Now, 8)
 	return &generation{
-		cfg: cfg, cert: cert, store: store, tokenDigests: digests,
+		cfg: cfg, cert: cert, store: store, status: statusHub, tokenDigests: digests,
 		allowedClients: append([]netip.Prefix(nil), cfg.Secrets.AllowedClients...),
 		identities:     identities,
 	}
@@ -210,9 +214,12 @@ func (r *Runtime) Reload() error {
 		r.cancel = nil
 	}
 	next := buildGeneration(cand.cfg, cand.cert, cand.specs, old)
+	if old != nil && old.status != nil {
+		old.status.Close()
+	}
 	// This single store prevents new credentials from ever observing an old or partially registered cache.
 	r.active.Store(next)
-	r.startLocked(cand.specs, next.store)
+	r.startLocked(cand.specs, next.store, next.status)
 	return nil
 }
 
@@ -227,21 +234,21 @@ func reloadCompatible(a, b config.Config) bool {
 }
 
 // start acquires the runtime lock and starts the supplied collectors against store.
-func (r *Runtime) start(specs []sourceSpec, store *cache.Store) {
+func (r *Runtime) start(specs []sourceSpec, store *cache.Store, observer drivers.PollObserver) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.startLocked(specs, store)
+	r.startLocked(specs, store, observer)
 }
 
 // startLocked launches polling and optional discovery against an already complete generation store.
-func (r *Runtime) startLocked(specs []sourceSpec, store *cache.Store) {
+func (r *Runtime) startLocked(specs []sourceSpec, store *cache.Store, observer drivers.PollObserver) {
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
 	for _, spec := range specs {
 		r.wg.Add(1)
 		go func(spec sourceSpec) {
 			defer r.wg.Done()
-			drivers.Run(ctx, spec.name, spec.interval, spec.collector, store, r.logger)
+			drivers.Run(ctx, spec.name, spec.interval, spec.collector, store, r.logger, observer)
 		}(spec)
 		if spec.discoverer != nil {
 			r.wg.Add(1)
@@ -272,6 +279,9 @@ func (r *Runtime) CloseContext(ctx context.Context) error {
 	r.mu.Lock()
 	if !r.closed {
 		r.closed = true
+		if active := r.active.Load(); active != nil && active.status != nil {
+			active.status.Close()
+		}
 		if r.cancel != nil {
 			r.cancel()
 			r.cancel = nil
@@ -300,7 +310,7 @@ func (r *Runtime) View() RuntimeView {
 		return RuntimeView{}
 	}
 	return RuntimeView{
-		Store: active.store, TokenDigests: append([][sha256.Size]byte(nil), active.tokenDigests...),
+		Store: active.store, Status: active.status, TokenDigests: append([][sha256.Size]byte(nil), active.tokenDigests...),
 		AllowedClients:      append([]netip.Prefix(nil), active.allowedClients...),
 		CertificateNotAfter: active.cert.Leaf.NotAfter,
 	}

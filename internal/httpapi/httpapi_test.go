@@ -6,7 +6,9 @@
 package httpapi
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"log/slog"
@@ -19,6 +21,7 @@ import (
 
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/cache"
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/metrics"
+	statusmodel "github.com/tseiman/HomeAutomationMonitorGW/internal/status"
 )
 
 // testHandler returns a populated API handler with two tokens and a documentation-network client allowlist.
@@ -27,8 +30,9 @@ func testHandler() http.Handler {
 	store.Register("controller-main", "snmp", time.Minute)
 	store.Success("controller-main", []metrics.Metric{{Name: "uptime", Value: uint64(7), ValueType: "counter", Timestamp: time.Unix(1, 0).UTC()}}, time.Millisecond)
 	digests := [][sha256.Size]byte{sha256.Sum256([]byte("first-token-for-tests")), sha256.Sum256([]byte("second-token-for-tests"))}
+	statusHub := statusmodel.New(store, time.Now, 8)
 	view := func() View {
-		return View{Store: store, TokenDigests: digests, AllowedClients: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24"), netip.MustParsePrefix("2001:db8::/64")}, CertificateNotAfter: time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)}
+		return View{Store: store, Status: statusHub, TokenDigests: digests, AllowedClients: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24"), netip.MustParsePrefix("2001:db8::/64")}, CertificateNotAfter: time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)}
 	}
 	return New(view, Options{Version: "1.0.0-test"})
 }
@@ -194,5 +198,163 @@ func TestRequestLoadsExactlyOneGeneration(t *testing.T) {
 	handler.ServeHTTP(response, request(http.MethodGet, "/api/v1/sources", "Bearer current-token-value"))
 	if response.Code != http.StatusOK || calls != 1 {
 		t.Fatalf("status=%d provider calls=%d", response.Code, calls)
+	}
+}
+
+type sseFrame struct {
+	ID      string
+	Event   string
+	Data    string
+	Comment string
+}
+
+func readSSEFrame(reader *bufio.Reader) (sseFrame, error) {
+	var frame sseFrame
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return frame, err
+		}
+		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		if line == "" {
+			return frame, nil
+		}
+		if strings.HasPrefix(line, ":") {
+			frame.Comment = strings.TrimSpace(strings.TrimPrefix(line, ":"))
+			continue
+		}
+		key, value, found := strings.Cut(line, ":")
+		if !found {
+			continue
+		}
+		value = strings.TrimPrefix(value, " ")
+		switch key {
+		case "id":
+			frame.ID = value
+		case "event":
+			frame.Event = value
+		case "data":
+			frame.Data = value
+		}
+	}
+}
+
+func TestStatusSnapshotRequiresExistingAuthorization(t *testing.T) {
+	h := testHandler()
+	unauthorized := httptest.NewRecorder()
+	h.ServeHTTP(unauthorized, request(http.MethodGet, "/api/v1/status", ""))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status code=%d", unauthorized.Code)
+	}
+
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, request(http.MethodGet, "/api/v1/status", "Bearer first-token-for-tests"))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status code=%d body=%s", response.Code, response.Body.String())
+	}
+	var snapshot statusmodel.Snapshot
+	if err := json.Unmarshal(response.Body.Bytes(), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.SchemaVersion != 1 || snapshot.Service != "running" || snapshot.Health.State != "ok" || snapshot.Activity.Active {
+		t.Fatalf("snapshot=%+v", snapshot)
+	}
+}
+
+func TestSSEStreamsSnapshotChangesHeartbeatAndEnforcesLimit(t *testing.T) {
+	store := cache.New(time.Now)
+	store.Register("ups-main", "nut", time.Minute)
+	store.Success("ups-main", []metrics.Metric{{Name: "ups.status", Value: "OL"}}, time.Millisecond)
+	hub := statusmodel.New(store, time.Now, 1)
+	t.Cleanup(hub.Close)
+	digest := sha256.Sum256([]byte("stream-token-for-tests"))
+	handler := New(func() View {
+		return View{
+			Store: store, Status: hub, TokenDigests: [][sha256.Size]byte{digest},
+			AllowedClients: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")},
+		}
+	}, Options{HeartbeatInterval: 10 * time.Millisecond})
+	server := httptest.NewUnstartedServer(handler)
+	server.Config.WriteTimeout = 25 * time.Millisecond
+	server.Start()
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/api/v1/status/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer stream-token-for-tests")
+	response, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != "text/event-stream" || response.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("stream status=%d headers=%v", response.StatusCode, response.Header)
+	}
+	reader := bufio.NewReader(response.Body)
+	initial, err := readSSEFrame(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.Event != "status" || initial.ID == "" {
+		t.Fatalf("initial frame=%+v", initial)
+	}
+	var initialStatus statusmodel.Snapshot
+	if err := json.Unmarshal([]byte(initial.Data), &initialStatus); err != nil || initialStatus.Activity.Active {
+		t.Fatalf("initial status=%+v err=%v", initialStatus, err)
+	}
+
+	second, err := http.NewRequest(http.MethodGet, server.URL+"/api/v1/status/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.Header.Set("Authorization", "Bearer stream-token-for-tests")
+	secondResponse, err := server.Client().Do(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondResponse.Body.Close()
+	if secondResponse.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("second stream status=%d", secondResponse.StatusCode)
+	}
+
+	heartbeatCount := 0
+	for heartbeatCount < 4 {
+		frame, readErr := readSSEFrame(reader)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if frame.Comment == "heartbeat" {
+			heartbeatCount++
+		}
+	}
+
+	hub.PollStarted("ups-main")
+	var active statusmodel.Snapshot
+	for attempts := 0; attempts < 5; attempts++ {
+		frame, readErr := readSSEFrame(reader)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if frame.Event != "status" {
+			continue
+		}
+		if err := json.Unmarshal([]byte(frame.Data), &active); err != nil {
+			t.Fatal(err)
+		}
+		if active.Activity.Active {
+			break
+		}
+	}
+	if !active.Activity.Active || len(active.Activity.Collectors) != 1 || active.Activity.Collectors[0] != "ups-main" {
+		t.Fatalf("active status=%+v", active)
+	}
+
+	hub.Close()
+	if _, err := readSSEFrame(reader); err == nil {
+		t.Fatal("stream remained open after hub close")
 	}
 }

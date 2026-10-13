@@ -7,9 +7,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestVersionFlag verifies that run prints the injected build version and reports success.
@@ -108,5 +110,26 @@ func TestNewLoggerUsesJSONByDefault(t *testing.T) {
 	newLogger(&output, false, "debug", "").Debug("visible")
 	if text := strings.TrimSpace(output.String()); !strings.HasPrefix(text, "{") || !strings.Contains(text, `"level":"DEBUG"`) {
 		t.Fatalf("JSON log=%q", text)
+	}
+}
+
+// TestShutdownComponentsRunsHTTPAndRuntimeConcurrently verifies streams are closed while HTTP shutdown waits.
+func TestShutdownComponentsRunsHTTPAndRuntimeConcurrently(t *testing.T) {
+	httpStarted := make(chan struct{})
+	runtimeStarted := make(chan struct{})
+	shutdownHTTP := func(context.Context) error {
+		close(httpStarted)
+		<-runtimeStarted
+		return nil
+	}
+	closeRuntime := func(context.Context) error {
+		close(runtimeStarted)
+		<-httpStarted
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := shutdownComponents(ctx, shutdownHTTP, closeRuntime); err != nil {
+		t.Fatal(err)
 	}
 }

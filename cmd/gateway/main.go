@@ -168,6 +168,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// shutdownComponents closes HTTP and runtime concurrently so long-lived streams can unblock server shutdown.
+func shutdownComponents(ctx context.Context, shutdownHTTP, closeRuntime func(context.Context) error) error {
+	errs := make(chan error, 2)
+	go func() { errs <- shutdownHTTP(ctx) }()
+	go func() { errs <- closeRuntime(ctx) }()
+	return errors.Join(<-errs, <-errs)
+}
+
 // serve loads configPaths, runs the HTTPS gateway using logOutput, logs reload failures without exiting, and returns any startup, serving, or graceful-shutdown error.
 func serve(configPaths []string, logOutput io.Writer, foreground bool, levelOverride string) error {
 	loaded, err := config.LoadFiles(configPaths, true)
@@ -188,7 +196,7 @@ func serve(configPaths []string, logOutput io.Writer, foreground bool, levelOver
 	cfg := runtime.Config()
 	handler := httpapi.New(func() httpapi.View {
 		view := runtime.View()
-		return httpapi.View{Store: view.Store, TokenDigests: view.TokenDigests, AllowedClients: view.AllowedClients, CertificateNotAfter: view.CertificateNotAfter}
+		return httpapi.View{Store: view.Store, Status: view.Status, TokenDigests: view.TokenDigests, AllowedClients: view.AllowedClients, CertificateNotAfter: view.CertificateNotAfter}
 	}, httpapi.Options{Version: version, Logger: logger})
 	server := &http.Server{Addr: cfg.Server.Listen, Handler: handler, ReadHeaderTimeout: cfg.Server.ReadTimeout.Duration, ReadTimeout: cfg.Server.ReadTimeout.Duration, WriteTimeout: cfg.Server.WriteTimeout.Duration, IdleTimeout: cfg.Server.IdleTimeout.Duration, MaxHeaderBytes: cfg.Server.MaxHeaderBytes, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: runtime.GetCertificate}}
 	errs := make(chan error, 1)
@@ -217,11 +225,10 @@ func serve(configPaths []string, logOutput io.Writer, foreground bool, levelOver
 			logger.Info("shutdown requested", "signal", sig.String())
 			// HTTP and collector shutdown share one deadline, so their combined latency remains bounded.
 			ctx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout.Duration)
-			serverErr := server.Shutdown(ctx)
-			runtimeErr := runtime.CloseContext(ctx)
+			shutdownErr := shutdownComponents(ctx, server.Shutdown, runtime.CloseContext)
 			cancel()
-			if serverErr != nil || runtimeErr != nil {
-				return fmt.Errorf("graceful shutdown: %w", errors.Join(serverErr, runtimeErr))
+			if shutdownErr != nil {
+				return fmt.Errorf("graceful shutdown: %w", shutdownErr)
 			}
 			err = <-errs
 			if errors.Is(err, http.ErrServerClosed) {

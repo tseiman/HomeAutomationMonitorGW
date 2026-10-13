@@ -132,6 +132,30 @@ func (s *Store) Snapshot(name string) (Snapshot, bool) {
 	return v, true
 }
 
+// Statuses returns metric-free source snapshots with age-based staleness applied in deterministic name order.
+func (s *Store) Statuses() []Snapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	names := make([]string, 0, len(s.m))
+	for name := range s.m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	now := s.now()
+	out := make([]Snapshot, 0, len(names))
+	for _, name := range names {
+		e := s.m[name]
+		status := e.snapshot
+		status.Metrics = nil
+		status.Discovery = nil
+		if !status.LastSuccess.IsZero() && now.Sub(status.LastSuccess) > e.staleAfter {
+			status.Stale = true
+		}
+		out = append(out, status)
+	}
+	return out
+}
+
 // All returns isolated snapshots for every source in deterministic name order.
 func (s *Store) All() []Snapshot {
 	s.mu.RLock()

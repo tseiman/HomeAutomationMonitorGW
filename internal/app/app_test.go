@@ -56,11 +56,30 @@ func TestReloadCommitsValidCandidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Close()
+	oldStatus := a.View().Status
+	if oldStatus == nil {
+		t.Fatal("initial runtime has no status hub")
+	}
+	oldEvents, _, err := oldStatus.Subscribe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	c2, k2 := pair(t, d, "two", 2)
 	os.WriteFile(token, []byte("second-token-value-0002"), 0o600)
 	writeConfig(t, cfg, c2, k2, token)
 	if err := a.Reload(); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case _, open := <-oldEvents:
+		if open {
+			t.Fatal("old status subscription remained open after reload")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("old status subscription was not closed on reload")
+	}
+	if currentStatus := a.View().Status; currentStatus == nil || currentStatus == oldStatus {
+		t.Fatal("reload did not publish a new status hub")
 	}
 	if got := a.Config().Secrets.BearerTokens; len(got) != 1 || got[0] != "second-token-value-0002" {
 		t.Fatalf("tokens=%q", got)

@@ -22,6 +22,7 @@ HomeAutomationMonitorGW is a small, read-only Linux monitoring gateway. It polls
 - [MIB metadata with `mib2json`](#mib-metadata-with-mib2json)
   - [Which MIB files are needed?](#which-mib-files-are-needed)
 - [API and Zabbix](#api-and-zabbix)
+  - [Live gateway status and SSE](#live-gateway-status-and-sse)
   - [WAGO K-bus Visualizer widget](#wago-k-bus-visualizer-widget)
   - [Per-collector health events for Honeycomb](#per-collector-health-events-for-honeycomb)
 - [Update and rollback](#update-and-rollback)
@@ -510,6 +511,79 @@ Every endpoint requires both an allowed TCP peer and a bearer token:
 - `GET /api/v1/sources/{name}/metrics`
 - `GET /api/v1/sources/{name}/discovery`
 - `GET /api/v1/metrics`
+- `GET /api/v1/status`
+- `GET /api/v1/status/events`
+
+### Live gateway status and SSE
+
+`GET /api/v1/status` returns the current gateway and collector runtime state as one JSON snapshot. `GET /api/v1/status/events` provides the same complete snapshot as a Server-Sent Events (SSE) stream on the existing HTTPS listener. Both routes use the same TLS configuration, TCP-peer allowlist, and bearer-token authentication as every existing API route; they open no additional port and do not change the Zabbix endpoints.
+
+A snapshot has this versioned shape:
+
+```json
+{
+  "schema_version": 1,
+  "sequence": 42,
+  "timestamp": "2026-10-13T20:15:12.123Z",
+  "service": "running",
+  "health": {
+    "code": 0,
+    "state": "ok"
+  },
+  "activity": {
+    "active": true,
+    "collectors": ["ups-main"]
+  },
+  "collectors": {
+    "ups-main": {
+      "driver": "nut",
+      "health": "ok",
+      "available": true,
+      "stale": false,
+      "polling": true,
+      "last_attempt": "2026-10-13T20:15:12.120Z",
+      "last_success": "2026-10-13T20:15:10Z"
+    }
+  }
+}
+```
+
+Health and activity are independent dimensions. `health.code` uses the gateway's operational collector state:
+
+- `0` / `ok`: every configured collector has fresh, available data;
+- `1` / `degraded`: a collector has not completed its first attempt or its last successful data is stale;
+- `2` / `failed`: a collector attempted a poll and is unavailable.
+
+The overall code is the highest collector code. This status describes gateway collection health; device-specific interpretations and thresholds in the Zabbix template continue to operate independently. `activity.active` becomes true immediately before a NUT or SNMP poll and false after its cache result is published. `activity.collectors` is sorted and can contain multiple names when polls overlap. If fresh cached data crosses its configured `stale_after` boundary while a poll is still running, the gateway publishes that health transition within 250 ms instead of waiting for the poll to finish.
+
+The SSE connection sends an immediate `status` event and another complete snapshot whenever poll activity or collector health can change:
+
+```text
+id: 42
+event: status
+data: {"schema_version":1,"sequence":42,"service":"running",...}
+
+: heartbeat
+
+```
+
+The `sequence` value increases monotonically within one runtime generation. A successful configuration reload intentionally closes existing streams so clients reconnect, authenticate against the new policy, and receive a new complete snapshot. Intermediate notifications are coalesced for slow clients; the latest snapshot always contains the authoritative current state. The gateway accepts at most eight simultaneous status streams.
+
+Heartbeats are emitted every 15 seconds. A stopped or unreachable process cannot send a final event, so a RevPi client must treat a failed connection, an EOF, or 45 seconds without any status event or heartbeat as `not reachable`, then reconnect with backoff. If an activity LED must remain human-visible for very short polls, hold that indication for 250–500 ms in the LED client; the gateway reports the real start and finish times without presentation delays.
+
+Use a dedicated RevPi token file and add the RevPi's actual source address to `authentication.allowed_clients`. To inspect the snapshot and stream manually without placing a real credential in documentation:
+
+```bash
+curl --fail --silent --show-error \
+  --header 'Authorization: Bearer <REVPI_TOKEN>' \
+  https://gateway.example/api/v1/status
+
+curl --fail --no-buffer \
+  --header 'Authorization: Bearer <REVPI_TOKEN>' \
+  https://gateway.example/api/v1/status/events
+```
+
+For a single multi-color LED, use the priority `not reachable > health error/degraded > activity > healthy idle`. Multiple LEDs can display health and activity independently.
 
 Import [`zabbix/template_homeauthmonitorgw.yaml`](zabbix/template_homeauthmonitorgw.yaml), set `{$AUTOMATION_GATEWAY_URL}`, secret `{$AUTOMATION_GATEWAY_TOKEN}`, `{$AUTOMATION_GATEWAY_INTERVAL}`, and `{$AUTOMATION_GATEWAY_TIMEOUT}`, and keep certificate verification enabled. Add the Zabbix server/proxy's actual TCP source address to `authentication.allowed_clients`. The template uses one HTTP master item and dependent discovery/items; it never contacts NUT or SNMP devices directly.
 

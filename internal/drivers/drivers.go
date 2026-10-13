@@ -26,9 +26,19 @@ type Discoverer interface {
 	Discover(context.Context) ([]metrics.Definition, error)
 }
 
+// PollObserver receives balanced activity transitions around each collector operation.
+type PollObserver interface {
+	PollStarted(name string)
+	PollFinished(name string)
+}
+
 // Run polls collector immediately and then at interval until ctx is canceled, updating store and logging every outcome when logger is provided.
-func Run(ctx context.Context, name string, interval time.Duration, collector Collector, store *cache.Store, logger *slog.Logger) {
+func Run(ctx context.Context, name string, interval time.Duration, collector Collector, store *cache.Store, logger *slog.Logger, observer PollObserver) {
 	poll := func() {
+		if observer != nil {
+			observer.PollStarted(name)
+			defer observer.PollFinished(name)
+		}
 		if logger != nil {
 			logger.Debug("collector poll started", "source", name)
 		}
