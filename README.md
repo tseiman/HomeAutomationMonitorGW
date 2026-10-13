@@ -273,6 +273,14 @@ ARCHIVE="automation-gateway-${VERSION}-linux-${ARCH}.tar.gz"
 shasum -a 256 -c "${ARCHIVE}.sha256"
 ```
 
+Keep the archive and its matching `.sha256` file in the same directory. A successful check prints:
+
+```text
+automation-gateway-<VERSION>-linux-arm64.tar.gz: OK
+```
+
+Do not transfer, extract, or install the archive if the command prints `FAILED`, reports a missing file, or returns a non-zero exit status. SHA-256 detects corruption or replacement relative to the checksum file; when downloading a release, obtain both files from the intended GitHub release over HTTPS and verify that the release/tag is the one you expect.
+
 Set the actual SSH user and target address once, then copy only the archive and its checksum:
 
 ```bash
@@ -293,7 +301,13 @@ BINARY="automation-gateway-linux-${ARCH}"
 
 cd /tmp
 sha256sum -c "${ARCHIVE}.sha256"
+```
 
+The Linux verification must print `${ARCHIVE}: OK`. Stop if it does not; do not run any of the extraction or installation commands below.
+
+Only after successful verification:
+
+```bash
 INSTALL_DIR="$(mktemp -d /tmp/HomeAutomationMonitorGW-install.XXXXXX)"
 tar -xzf "$ARCHIVE" -C "$INSTALL_DIR"
 cd "$INSTALL_DIR"

@@ -115,9 +115,24 @@ The installer preserves an existing configuration and token. Without `--start`, 
 The project release script creates a separate optional archive and checksum for the LED client. It is not placed inside the normal gateway archive.
 
 ```bash
-sha256sum -c automation-gateway-led-VERSION-linux-armv7.tar.gz.sha256
+ARCHIVE="automation-gateway-led-VERSION-linux-armv7.tar.gz"
+test -f "$ARCHIVE" -a -f "${ARCHIVE}.sha256"
+sha256sum -c "${ARCHIVE}.sha256"
+```
+
+The archive and its matching `.sha256` file must be in the same directory. Continue only if the command prints:
+
+```text
+automation-gateway-led-VERSION-linux-armv7.tar.gz: OK
+```
+
+Do not extract or install the archive after `FAILED`, a missing-file message, or any non-zero exit status. When downloading a release, obtain both files from the intended GitHub release over HTTPS and verify that the release/tag is the one you expect. SHA-256 proves integrity relative to the checksum file; it does not make an untrusted checksum source trustworthy.
+
+After a successful checksum verification:
+
+```bash
 INSTALL_DIR="$(mktemp -d /tmp/automation-gateway-led-install.XXXXXX)"
-tar -xzf automation-gateway-led-VERSION-linux-armv7.tar.gz -C "$INSTALL_DIR"
+tar -xzf "$ARCHIVE" -C "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 sudo ./install.sh --binary="$INSTALL_DIR/automation-gateway-led-linux-armv7"
 ```
