@@ -25,8 +25,9 @@ type Health struct {
 }
 
 type Activity struct {
-	Active     bool     `json:"active"`
-	Collectors []string `json:"collectors"`
+	Active       bool     `json:"active"`
+	Collectors   []string `json:"collectors"`
+	PollSequence uint64   `json:"poll_sequence"`
 }
 
 type Collector struct {
@@ -56,6 +57,7 @@ type Hub struct {
 
 	mu              sync.Mutex
 	sequence        uint64
+	pollSequence    uint64
 	active          map[string]int
 	healthCodes     map[string]int
 	subscribers     map[chan struct{}]struct{}
@@ -94,6 +96,7 @@ func (h *Hub) PollStarted(name string) {
 		return
 	}
 	h.active[name]++
+	h.pollSequence++
 	h.healthCodes = h.currentHealthCodesLocked()
 	h.notifyLocked()
 }
@@ -115,6 +118,7 @@ func (h *Hub) PollFinished(name string) {
 func (h *Hub) Snapshot() Snapshot {
 	h.mu.Lock()
 	sequence := h.sequence
+	pollSequence := h.pollSequence
 	active := make(map[string]int, len(h.active))
 	for name, count := range h.active {
 		active[name] = count
@@ -127,7 +131,7 @@ func (h *Hub) Snapshot() Snapshot {
 		Timestamp:     h.now().UTC(),
 		Service:       "running",
 		Health:        Health{Code: 2, State: "failed"},
-		Activity:      Activity{Collectors: []string{}},
+		Activity:      Activity{Collectors: []string{}, PollSequence: pollSequence},
 		Collectors:    map[string]Collector{},
 	}
 	if h.store != nil {

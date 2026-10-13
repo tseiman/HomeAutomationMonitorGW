@@ -1,0 +1,19 @@
+# HomeAutomationMonitorGW SSE endpoint. HTTPS is mandatory.
+gateway_url: "https://gateway.example/api/v1/status/events"
+
+# Provision this file separately as root:automation-gateway-led mode 0640.
+token_file: "/etc/automation-gateway-led/token"
+
+# Optional PEM CA bundle for a private gateway CA. System roots remain available.
+# ca_file: "/etc/automation-gateway-led/gateway-ca.pem"
+
+# Select exactly one freely programmable RevPi status LED: A1 or A2.
+led: "A1"
+
+# Keep very short collector activity visible beyond the actual active phase.
+activity_hold: "750ms"
+
+# The gateway sends heartbeats every 15s. Values <=15s are rejected.
+stream_timeout: "45s"
+reconnect_min: "1s"
+reconnect_max: "30s"

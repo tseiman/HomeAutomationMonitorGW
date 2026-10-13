@@ -16,6 +16,7 @@ HomeAutomationMonitorGW is a small, read-only Linux monitoring gateway. It polls
 - [Build and installation](#build-and-installation)
   - [TLS and token permissions](#tls-and-token-permissions)
 - [Cross-build and installation](#cross-build-and-installation)
+- [Optional RevPi status LED client](#optional-revpi-status-led-client)
 - [Configuration](#configuration)
   - [NUT](#nut)
   - [SNMPv3](#snmpv3)
@@ -50,7 +51,7 @@ HomeAutomationMonitorGW is a small, read-only Linux monitoring gateway. It polls
 - `snmptranslate` from the Debian `snmp` package: required only on the workstation that runs `mib2json`; it is not a gateway runtime dependency.
 - Node.js: optional, used only for additional Zabbix JavaScript tests.
 
-Go dependencies are pinned through `go.mod` and `go.sum`: GoSNMP for SNMPv3 and `yaml.v3` for strict YAML parsing.
+Go dependencies are pinned through `go.mod` and `go.sum`: GoSNMP for SNMPv3, `yaml.v3` for strict YAML parsing, and the optional RevPi LED client's `gopicontrol` hardware adapter.
 
 ## Build and installation
 
@@ -187,7 +188,7 @@ git pull --ff-only
 ./scripts/package_release.sh arm64
 ```
 
-Replace `arm64` with exactly one architecture from step 1. The script requires a clean Git worktree, downloads checksummed Go modules, injects version metadata, cross-compiles `./cmd/gateway`, creates checksums, stages only installation material, and writes the finished outputs to the **project root**.
+Replace `arm64` with exactly one architecture from step 1. The script requires a clean Git worktree, downloads checksummed Go modules, injects version metadata, cross-compiles `./cmd/gateway` and the separate optional `./clients/revpi-led` service, creates checksums, stages only installation material, and writes the finished outputs to the **project root**. The normal gateway archive remains unchanged and never installs the LED client.
 
 For an untagged ARM64 commit, the outputs are:
 
@@ -196,6 +197,15 @@ automation-gateway-linux-arm64
 automation-gateway-linux-arm64.sha256
 automation-gateway-<SHORT-GIT-HASH>-linux-arm64.tar.gz
 automation-gateway-<SHORT-GIT-HASH>-linux-arm64.tar.gz.sha256
+```
+
+It also emits the separately installable optional LED artifacts:
+
+```text
+automation-gateway-led-linux-arm64
+automation-gateway-led-linux-arm64.sha256
+automation-gateway-led-<SHORT-GIT-HASH>-linux-arm64.tar.gz
+automation-gateway-led-<SHORT-GIT-HASH>-linux-arm64.tar.gz.sha256
 ```
 
 The raw binary and both portable SHA-256 files contain only relative filenames. The `tar.gz` contains exactly the runtime installation material—no Go source tree:
@@ -223,6 +233,8 @@ This also creates:
 ```text
 automation-gateway_<DEBIAN-VERSION>_arm64.deb
 automation-gateway_<DEBIAN-VERSION>_arm64.deb.sha256
+automation-gateway-led_<DEBIAN-VERSION>_arm64.deb
+automation-gateway-led_<DEBIAN-VERSION>_arm64.deb.sha256
 ```
 
 A Windows executable and ZIP are created only if the current code successfully cross-compiles for the selected Windows architecture. The gateway currently uses Unix-only secure-file and signal APIs, so the Windows probe is expected to report that Windows is unsupported and skip the ZIP. The script never publishes a misleading or incomplete Windows archive.
@@ -344,6 +356,12 @@ sudo systemctl enable --now automation-gateway
 ```
 
 Choose either the archive installer or the Debian package for a host; do not mix the two installation methods, because they intentionally use their platform-appropriate binary and systemd package locations.
+
+## Optional RevPi status LED client
+
+The standalone client under [`clients/revpi-led`](clients/revpi-led/) consumes `/api/v1/status/events` and maps gateway connectivity, collector health, and poll activity onto RevPi LED A1 or A2. Very short polls remain visibly green for a configurable minimum duration (default `750ms`). It runs as an unprivileged, separately configured systemd service and is never installed by `scripts/install.sh`.
+
+Its own [README](clients/revpi-led/README.md) contains the Core 3 `piTest` hardware check, manual and cross-build commands, token/CA provisioning, state priority, dedicated installer, systemd hardening, and release-archive instructions. The release script and tagged GitHub workflow produce separate `automation-gateway-led-*` archives and optional Debian packages; installation remains an explicit choice.
 
 ## Configuration
 
@@ -532,7 +550,8 @@ A snapshot has this versioned shape:
   },
   "activity": {
     "active": true,
-    "collectors": ["ups-main"]
+    "collectors": ["ups-main"],
+    "poll_sequence": 17
   },
   "collectors": {
     "ups-main": {
@@ -554,7 +573,7 @@ Health and activity are independent dimensions. `health.code` uses the gateway's
 - `1` / `degraded`: a collector has not completed its first attempt or its last successful data is stale;
 - `2` / `failed`: a collector attempted a poll and is unavailable.
 
-The overall code is the highest collector code. This status describes gateway collection health; device-specific interpretations and thresholds in the Zabbix template continue to operate independently. `activity.active` becomes true immediately before a NUT or SNMP poll and false after its cache result is published. `activity.collectors` is sorted and can contain multiple names when polls overlap. If fresh cached data crosses its configured `stale_after` boundary while a poll is still running, the gateway publishes that health transition within 250 ms instead of waiting for the poll to finish.
+The overall code is the highest collector code. This status describes gateway collection health; device-specific interpretations and thresholds in the Zabbix template continue to operate independently. `activity.active` becomes true immediately before a NUT or SNMP poll and false after its cache result is published. `activity.collectors` is sorted and can contain multiple names when polls overlap. `activity.poll_sequence` increases for every started poll and allows presentation clients to detect a very short poll even when bounded SSE notifications were coalesced before the client read them. If fresh cached data crosses its configured `stale_after` boundary while a poll is still running, the gateway publishes that health transition within 250 ms instead of waiting for the poll to finish.
 
 The SSE connection sends an immediate `status` event and another complete snapshot whenever poll activity or collector health can change:
 
@@ -567,9 +586,9 @@ data: {"schema_version":1,"sequence":42,"service":"running",...}
 
 ```
 
-The `sequence` value increases monotonically within one runtime generation. A successful configuration reload intentionally closes existing streams so clients reconnect, authenticate against the new policy, and receive a new complete snapshot. Intermediate notifications are coalesced for slow clients; the latest snapshot always contains the authoritative current state. The gateway accepts at most eight simultaneous status streams.
+The `sequence` and `activity.poll_sequence` values increase monotonically within one runtime generation. A successful configuration reload intentionally closes existing streams so clients reconnect, authenticate against the new policy, and receive a new complete snapshot. Intermediate notifications are coalesced for slow clients; the latest snapshot always contains the authoritative current state, while a changed `activity.poll_sequence` records that one or more polls started between snapshots. The gateway accepts at most eight simultaneous status streams.
 
-Heartbeats are emitted every 15 seconds. A stopped or unreachable process cannot send a final event, so a RevPi client must treat a failed connection, an EOF, or 45 seconds without any status event or heartbeat as `not reachable`, then reconnect with backoff. If an activity LED must remain human-visible for very short polls, hold that indication for 250–500 ms in the LED client; the gateway reports the real start and finish times without presentation delays.
+Heartbeats are emitted every 15 seconds. A stopped or unreachable process cannot send a final event, so a RevPi client must treat a failed connection, an EOF, or 45 seconds without any status event or heartbeat as `not reachable`, then reconnect with backoff. The optional RevPi client uses `activity.poll_sequence` to recover coalesced short polls and keeps green visible for `750ms` by default; the gateway itself reports activity without presentation delays.
 
 Use a dedicated RevPi token file and add the RevPi's actual source address to `authentication.allowed_clients`. To inspect the snapshot and stream manually without placing a real credential in documentation:
 

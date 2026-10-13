@@ -12,9 +12,12 @@ OUTPUT_DIR="${PACKAGE_OUTPUT_DIR:-$PROJECT_ROOT}"
 ALLOW_DIRTY="${PACKAGE_ALLOW_DIRTY:-0}"
 BUILD_DEB=false
 STAGE_DIR=""
+LED_STAGE_DIR=""
 WINDOWS_STAGE_DIR=""
 DEB_STAGE_DIR=""
+LED_DEB_STAGE_DIR=""
 LINUX_BUILD_TEMP=""
+LED_BUILD_TEMP=""
 
 usage() {
     cat <<'USAGE'
@@ -33,6 +36,13 @@ Outputs are written to the repository root by default:
   automation-gateway-linux-ARCH.sha256
   automation-gateway-VERSION-linux-ARCH.tar.gz
   automation-gateway-VERSION-linux-ARCH.tar.gz.sha256
+  automation-gateway-led-linux-ARCH
+  automation-gateway-led-linux-ARCH.sha256
+  automation-gateway-led-VERSION-linux-ARCH.tar.gz
+  automation-gateway-led-VERSION-linux-ARCH.tar.gz.sha256
+
+The LED client outputs are separate and optional; installing the gateway archive does
+not install or enable the LED service.
 
 A Windows executable and ZIP are emitted only when the current source tree
 successfully cross-compiles for the corresponding Windows architecture.
@@ -57,14 +67,23 @@ cleanup() {
     if [[ -n "$STAGE_DIR" && -d "$STAGE_DIR" ]]; then
         rm -rf "$STAGE_DIR"
     fi
+    if [[ -n "$LED_STAGE_DIR" && -d "$LED_STAGE_DIR" ]]; then
+        rm -rf "$LED_STAGE_DIR"
+    fi
     if [[ -n "$WINDOWS_STAGE_DIR" && -d "$WINDOWS_STAGE_DIR" ]]; then
         rm -rf "$WINDOWS_STAGE_DIR"
     fi
     if [[ -n "$DEB_STAGE_DIR" && -d "$DEB_STAGE_DIR" ]]; then
         rm -rf "$DEB_STAGE_DIR"
     fi
+    if [[ -n "$LED_DEB_STAGE_DIR" && -d "$LED_DEB_STAGE_DIR" ]]; then
+        rm -rf "$LED_DEB_STAGE_DIR"
+    fi
     if [[ -n "$LINUX_BUILD_TEMP" && -f "$LINUX_BUILD_TEMP" ]]; then
         rm -f "$LINUX_BUILD_TEMP"
+    fi
+    if [[ -n "$LED_BUILD_TEMP" && -f "$LED_BUILD_TEMP" ]]; then
+        rm -f "$LED_BUILD_TEMP"
     fi
 }
 trap cleanup EXIT
@@ -139,6 +158,20 @@ site-owned token and TLS files before starting the service. Existing site-owned
 configuration, tokens, secrets, and TLS files are preserved during updates.
 EOF_INSTALL
     chmod 0644 "$install_text"
+}
+
+copy_led_material() {
+    local binary="$1"
+    local destination="$2"
+
+    install -d -m 0755 "$destination/systemd"
+    install -m 0755 "$binary" "$destination/$LED_BINARY_NAME"
+    install -m 0755 "$PROJECT_ROOT/clients/revpi-led/install.sh" "$destination/install.sh"
+    install -m 0644 "$PROJECT_ROOT/clients/revpi-led/config.example.yaml" "$destination/config.example.yaml"
+    install -m 0644 "$PROJECT_ROOT/clients/revpi-led/systemd/automation-gateway-led.service" "$destination/systemd/automation-gateway-led.service"
+    install -m 0644 "$PROJECT_ROOT/clients/revpi-led/README.md" "$destination/README.md"
+    install -m 0644 "$PROJECT_ROOT/clients/revpi-led/THIRD_PARTY_LICENSES.md" "$destination/THIRD_PARTY_LICENSES.md"
+    install -m 0644 "$PROJECT_ROOT/LICENSE" "$destination/LICENSE"
 }
 
 build_windows_package_if_supported() {
@@ -324,6 +357,128 @@ EOF_POSTRM
     log "created $deb_name"
 }
 
+build_led_debian_package() {
+    local deb_version deb_name deb_path control postinst prerm postrm unit_target
+    require_command dpkg-deb
+    deb_version="$(debian_version "$VERSION")"
+    deb_name="automation-gateway-led_${deb_version}_${DEB_ARCH}.deb"
+    deb_path="$OUTPUT_DIR/$deb_name"
+    LED_DEB_STAGE_DIR="$(mktemp -d "${PACKAGE_TMPDIR:-/tmp}/automation-gateway-led.deb-stage.XXXXXX")"
+    chmod 0755 "$LED_DEB_STAGE_DIR"
+
+    install -d -m 0755 \
+        "$LED_DEB_STAGE_DIR/DEBIAN" \
+        "$LED_DEB_STAGE_DIR/usr/sbin" \
+        "$LED_DEB_STAGE_DIR/usr/share/automation-gateway-led" \
+        "$LED_DEB_STAGE_DIR/usr/share/doc/automation-gateway-led" \
+        "$LED_DEB_STAGE_DIR/lib/systemd/system"
+    install -m 0755 "$LED_BINARY_PATH" "$LED_DEB_STAGE_DIR/usr/sbin/automation-gateway-led"
+    install -m 0644 "$PROJECT_ROOT/clients/revpi-led/config.example.yaml" "$LED_DEB_STAGE_DIR/usr/share/automation-gateway-led/config.example.yaml"
+    install -m 0644 "$PROJECT_ROOT/clients/revpi-led/README.md" "$LED_DEB_STAGE_DIR/usr/share/doc/automation-gateway-led/README.md"
+    install -m 0644 "$PROJECT_ROOT/clients/revpi-led/THIRD_PARTY_LICENSES.md" "$LED_DEB_STAGE_DIR/usr/share/doc/automation-gateway-led/THIRD_PARTY_LICENSES.md"
+    install -m 0644 "$PROJECT_ROOT/LICENSE" "$LED_DEB_STAGE_DIR/usr/share/doc/automation-gateway-led/copyright"
+
+    unit_target="$LED_DEB_STAGE_DIR/lib/systemd/system/automation-gateway-led.service"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+            ExecStart=*) printf '%s\n' 'ExecStart=/usr/sbin/automation-gateway-led --config /etc/automation-gateway-led/config.yaml' ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done < "$PROJECT_ROOT/clients/revpi-led/systemd/automation-gateway-led.service" > "$unit_target"
+    chmod 0644 "$unit_target"
+
+    control="$LED_DEB_STAGE_DIR/DEBIAN/control"
+    cat > "$control" <<EOF_LED_CONTROL
+Package: automation-gateway-led
+Version: $deb_version
+Section: net
+Priority: optional
+Architecture: $DEB_ARCH
+Maintainer: aiAgentTseiman <ai-agent.tseiman@tseiman.de>
+Depends: adduser, systemd
+Description: Optional RevPi LED client for HomeAutomationMonitorGW
+ Consumes the authenticated gateway SSE status stream and displays connectivity,
+ collector health, and activity on one programmable Revolution Pi status LED.
+EOF_LED_CONTROL
+    chmod 0644 "$control"
+
+    postinst="$LED_DEB_STAGE_DIR/DEBIAN/postinst"
+    cat > "$postinst" <<'EOF_LED_POSTINST'
+#!/bin/sh
+set -e
+
+die() {
+    echo "automation-gateway-led: $*" >&2
+    exit 1
+}
+
+reject_symlink() {
+    if [ -L "$1" ]; then
+        die "refusing symlink: $1"
+    fi
+}
+
+if ! getent group automation-gateway-led >/dev/null; then
+    addgroup --system automation-gateway-led
+fi
+if ! getent passwd automation-gateway-led >/dev/null; then
+    adduser --system --ingroup automation-gateway-led --no-create-home --home /nonexistent --shell /usr/sbin/nologin automation-gateway-led
+fi
+if getent group picontrol >/dev/null; then
+    usermod -a -G picontrol automation-gateway-led
+else
+    echo "automation-gateway-led: WARNING: picontrol group is missing; install the RevPi piControl packages before enabling the service" >&2
+fi
+reject_symlink /etc/automation-gateway-led
+if [ -e /etc/automation-gateway-led ] && [ ! -d /etc/automation-gateway-led ]; then
+    die "expected directory: /etc/automation-gateway-led"
+fi
+install -d -o root -g automation-gateway-led -m 0750 /etc/automation-gateway-led
+reject_symlink /etc/automation-gateway-led/config.yaml
+if [ ! -e /etc/automation-gateway-led/config.yaml ]; then
+    install -o root -g automation-gateway-led -m 0640 /usr/share/automation-gateway-led/config.example.yaml /etc/automation-gateway-led/config.yaml
+elif [ ! -f /etc/automation-gateway-led/config.yaml ]; then
+    die "expected regular configuration: /etc/automation-gateway-led/config.yaml"
+fi
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+fi
+exit 0
+EOF_LED_POSTINST
+    chmod 0755 "$postinst"
+
+    prerm="$LED_DEB_STAGE_DIR/DEBIAN/prerm"
+    cat > "$prerm" <<'EOF_LED_PRERM'
+#!/bin/sh
+set -e
+case "${1:-}" in
+    remove|deconfigure)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop automation-gateway-led.service || true
+        fi
+        ;;
+esac
+exit 0
+EOF_LED_PRERM
+    chmod 0755 "$prerm"
+
+    postrm="$LED_DEB_STAGE_DIR/DEBIAN/postrm"
+    cat > "$postrm" <<'EOF_LED_POSTRM'
+#!/bin/sh
+set -e
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+fi
+exit 0
+EOF_LED_POSTRM
+    chmod 0755 "$postrm"
+
+    rm -f "$deb_path"
+    dpkg-deb --root-owner-group --build "$LED_DEB_STAGE_DIR" "$deb_path" >/dev/null
+    write_sha256 "$deb_path"
+    log "created $deb_name"
+}
+
 [[ $# -ge 1 && $# -le 2 ]] || { usage >&2; exit 2; }
 TARGET_ARCH="$1"
 if [[ $# -eq 2 ]]; then
@@ -402,6 +557,20 @@ LINUX_BUILD_TEMP=""
 write_sha256 "$LINUX_BINARY_PATH"
 log "created $LINUX_BINARY_NAME"
 
+LED_BINARY_NAME="automation-gateway-led-linux-${ARCH_LABEL}"
+LED_BINARY_PATH="$OUTPUT_DIR/$LED_BINARY_NAME"
+LED_BUILD_TEMP="$(mktemp "${PACKAGE_TMPDIR:-/tmp}/automation-gateway-led.linux.XXXXXX")"
+if [[ -n "$GOARM_VALUE" ]]; then
+    (cd "$PROJECT_ROOT" && CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH_VALUE" GOARM="$GOARM_VALUE" GOPROXY=off go build -trimpath -ldflags "$LDFLAGS" -o "$LED_BUILD_TEMP" ./clients/revpi-led)
+else
+    (cd "$PROJECT_ROOT" && CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH_VALUE" GOPROXY=off go build -trimpath -ldflags "$LDFLAGS" -o "$LED_BUILD_TEMP" ./clients/revpi-led)
+fi
+install -m 0755 "$LED_BUILD_TEMP" "$LED_BINARY_PATH"
+rm -f "$LED_BUILD_TEMP"
+LED_BUILD_TEMP=""
+write_sha256 "$LED_BINARY_PATH"
+log "created $LED_BINARY_NAME"
+
 STAGE_DIR="$(mktemp -d "${PACKAGE_TMPDIR:-/tmp}/automation-gateway.linux-stage.XXXXXX")"
 copy_linux_material "$LINUX_BINARY_PATH" "$STAGE_DIR"
 LINUX_ARCHIVE="$OUTPUT_DIR/automation-gateway-${FILENAME_VERSION}-linux-${ARCH_LABEL}.tar.gz"
@@ -410,9 +579,18 @@ tar -C "$STAGE_DIR" -czf "$LINUX_ARCHIVE" .
 write_sha256 "$LINUX_ARCHIVE"
 log "created $(basename "$LINUX_ARCHIVE")"
 
+LED_STAGE_DIR="$(mktemp -d "${PACKAGE_TMPDIR:-/tmp}/automation-gateway-led.linux-stage.XXXXXX")"
+copy_led_material "$LED_BINARY_PATH" "$LED_STAGE_DIR"
+LED_ARCHIVE="$OUTPUT_DIR/automation-gateway-led-${FILENAME_VERSION}-linux-${ARCH_LABEL}.tar.gz"
+rm -f "$LED_ARCHIVE"
+tar -C "$LED_STAGE_DIR" -czf "$LED_ARCHIVE" .
+write_sha256 "$LED_ARCHIVE"
+log "created $(basename "$LED_ARCHIVE")"
+
 build_windows_package_if_supported
 if [[ "$BUILD_DEB" == "true" ]]; then
     build_debian_package
+    build_led_debian_package
 fi
 
 log "release material written to $OUTPUT_DIR"

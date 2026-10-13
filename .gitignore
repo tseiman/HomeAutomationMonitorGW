@@ -31,6 +31,7 @@ go.work.sum
 /automation-gateway-*-linux-*.tar.gz*
 /automation-gateway-*-windows-*.zip*
 /automation-gateway_*.deb*
+/automation-gateway-led_*.deb*
 
 # env file
 .env

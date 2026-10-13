@@ -58,6 +58,9 @@ func TestActivityTracksOverlappingPolls(t *testing.T) {
 	hub.PollStarted("wago-main")
 
 	got := hub.Snapshot()
+	if got.Activity.PollSequence != 3 {
+		t.Fatalf("poll sequence=%d, want 3 starts", got.Activity.PollSequence)
+	}
 	if len(got.Activity.Collectors) != 2 || got.Activity.Collectors[0] != "ups-main" || got.Activity.Collectors[1] != "wago-main" {
 		t.Fatalf("activity=%+v", got.Activity)
 	}

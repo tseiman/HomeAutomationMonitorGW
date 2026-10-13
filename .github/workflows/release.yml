@@ -75,6 +75,8 @@ jobs:
           path: |
             automation-gateway-linux-${{ matrix.arch }}
             automation-gateway-linux-${{ matrix.arch }}.sha256
+            automation-gateway-led-linux-${{ matrix.arch }}
+            automation-gateway-led-linux-${{ matrix.arch }}.sha256
             automation-gateway-*-linux-${{ matrix.arch }}.tar.gz
             automation-gateway-*-linux-${{ matrix.arch }}.tar.gz.sha256
             automation-gateway-windows-${{ matrix.arch }}.exe
@@ -83,6 +85,8 @@ jobs:
             automation-gateway-*-windows-${{ matrix.arch }}.zip.sha256
             automation-gateway_*.deb
             automation-gateway_*.deb.sha256
+            automation-gateway-led_*.deb
+            automation-gateway-led_*.deb.sha256
 
   release:
     name: Publish GitHub release

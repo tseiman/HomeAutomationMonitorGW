@@ -47,6 +47,13 @@ func TestPackageReleaseBuildsMinimalLinuxBundle(t *testing.T) {
 	assertSHA256File(t, binaryPath, binaryPath+".sha256")
 	assertSHA256File(t, archivePath, archivePath+".sha256")
 
+	ledBinaryName := "automation-gateway-led-linux-arm64"
+	ledBinaryPath := filepath.Join(output, ledBinaryName)
+	ledArchiveName := fmt.Sprintf("automation-gateway-led-%s-linux-arm64.tar.gz", filenameVersion(version))
+	ledArchivePath := filepath.Join(output, ledArchiveName)
+	assertSHA256File(t, ledBinaryPath, ledBinaryPath+".sha256")
+	assertSHA256File(t, ledArchivePath, ledArchivePath+".sha256")
+
 	versionOutput, err := exec.Command(binaryPath, "--version").CombinedOutput()
 	if err != nil {
 		t.Fatalf("packaged binary --version failed: %v\n%s", err, versionOutput)
@@ -68,6 +75,21 @@ func TestPackageReleaseBuildsMinimalLinuxBundle(t *testing.T) {
 	sort.Strings(wantEntries)
 	if strings.Join(gotEntries, "\n") != strings.Join(wantEntries, "\n") {
 		t.Fatalf("archive entries:\n%s\nwant:\n%s", strings.Join(gotEntries, "\n"), strings.Join(wantEntries, "\n"))
+	}
+
+	gotLEDEntries := tarGzipEntries(t, ledArchivePath)
+	wantLEDEntries := []string{
+		"LICENSE",
+		"README.md",
+		"THIRD_PARTY_LICENSES.md",
+		ledBinaryName,
+		"config.example.yaml",
+		"install.sh",
+		"systemd/automation-gateway-led.service",
+	}
+	sort.Strings(wantLEDEntries)
+	if strings.Join(gotLEDEntries, "\n") != strings.Join(wantLEDEntries, "\n") {
+		t.Fatalf("LED archive entries:\n%s\nwant:\n%s", strings.Join(gotLEDEntries, "\n"), strings.Join(wantLEDEntries, "\n"))
 	}
 
 	matches, err := filepath.Glob(filepath.Join(output, "*.zip"))
@@ -104,11 +126,23 @@ func TestPackageReleaseBuildsDebianPackage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(matches) != 1 {
-		t.Fatalf("Debian packages = %v, want exactly one", matches)
+	if len(matches) != 2 {
+		t.Fatalf("Debian packages = %v, want gateway and optional LED client", matches)
 	}
-	debPath := matches[0]
-	assertSHA256File(t, debPath, debPath+".sha256")
+	packages := make(map[string]string)
+	for _, path := range matches {
+		assertSHA256File(t, path, path+".sha256")
+		name, err := exec.Command("dpkg-deb", "-f", path, "Package").Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		packages[strings.TrimSpace(string(name))] = path
+	}
+	debPath := packages["automation-gateway"]
+	ledDebPath := packages["automation-gateway-led"]
+	if debPath == "" || ledDebPath == "" {
+		t.Fatalf("unexpected Debian package set: %v", packages)
+	}
 
 	fields, err := exec.Command("dpkg-deb", "-f", debPath, "Package", "Architecture", "Version").CombinedOutput()
 	if err != nil {
@@ -119,6 +153,13 @@ func TestPackageReleaseBuildsDebianPackage(t *testing.T) {
 	wantDebianVersion := testDebianVersion(version)
 	if !strings.Contains(metadata, "Package: automation-gateway") || !strings.Contains(metadata, "Architecture: arm64") || !strings.Contains(metadata, "Version: "+wantDebianVersion) {
 		t.Fatalf("unexpected Debian metadata:\n%s", metadata)
+	}
+	ledFields, err := exec.Command("dpkg-deb", "-f", ledDebPath, "Package", "Architecture", "Version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("LED dpkg-deb metadata failed: %v\n%s", err, ledFields)
+	}
+	if text := string(ledFields); !strings.Contains(text, "Package: automation-gateway-led") || !strings.Contains(text, "Architecture: arm64") || !strings.Contains(text, "Version: "+wantDebianVersion) {
+		t.Fatalf("unexpected LED Debian metadata:\n%s", text)
 	}
 
 	extracted := t.TempDir()
@@ -133,6 +174,20 @@ func TestPackageReleaseBuildsDebianPackage(t *testing.T) {
 	} {
 		if _, err := os.Stat(filepath.Join(extracted, relative)); err != nil {
 			t.Fatalf("missing Debian payload %s: %v", relative, err)
+		}
+	}
+	ledExtracted := t.TempDir()
+	if output, err := exec.Command("dpkg-deb", "-x", ledDebPath, ledExtracted).CombinedOutput(); err != nil {
+		t.Fatalf("LED dpkg-deb extraction failed: %v\n%s", err, output)
+	}
+	for _, relative := range []string{
+		"usr/sbin/automation-gateway-led",
+		"usr/share/automation-gateway-led/config.example.yaml",
+		"usr/share/doc/automation-gateway-led/README.md",
+		"lib/systemd/system/automation-gateway-led.service",
+	} {
+		if _, err := os.Stat(filepath.Join(ledExtracted, relative)); err != nil {
+			t.Fatalf("missing LED Debian payload %s: %v", relative, err)
 		}
 	}
 	controlDir := t.TempDir()
