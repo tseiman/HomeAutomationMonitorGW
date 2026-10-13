@@ -15,7 +15,7 @@ HomeAutomationMonitorGW is a small, read-only Linux monitoring gateway. It polls
 - [Software dependencies](#software-dependencies)
 - [Build and installation](#build-and-installation)
   - [TLS and token permissions](#tls-and-token-permissions)
-- [Cross-build and installation](#cross-build-and-installation)
+- [Cross-build, packaging, transfer, and installation](#cross-build-packaging-transfer-and-installation)
 - [Optional RevPi status LED client](#optional-revpi-status-led-client)
 - [Configuration](#configuration)
   - [NUT](#nut)
