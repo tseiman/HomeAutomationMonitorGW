@@ -26,7 +26,8 @@ usage() {
     cat <<'USAGE'
 Usage: ./clients/revpi-led/install.sh [--binary=PATH] [--start]
 
-Without --binary, build the LED client from the current repository checkout.
+Inside an extracted release archive, select the bundled binary automatically.
+In a source checkout, omitting --binary builds the LED client locally.
 The installer is optional and never runs from the gateway installer.
 
 Options:
@@ -64,6 +65,28 @@ ensure_identity() {
         adduser --system --ingroup "$SERVICE_GROUP" --no-create-home --home /nonexistent --shell /usr/sbin/nologin "$SERVICE_USER"
     fi
     usermod -a -G "$PICONTROL_GROUP" "$SERVICE_USER"
+}
+
+select_bundled_release_binary() {
+    local candidate
+    local -a candidates=()
+
+    # main.go is present in the source component but intentionally omitted from
+    # the portable archive. INSTALL.txt is generated only for that archive.
+    [[ ! -e "$COMPONENT_DIR/main.go" ]] || return 1
+    [[ -f "$COMPONENT_DIR/INSTALL.txt" && ! -L "$COMPONENT_DIR/INSTALL.txt" ]] || return 1
+
+    shopt -s nullglob
+    for candidate in "$COMPONENT_DIR"/automation-gateway-led-linux-*; do
+        if [[ -f "$candidate" && ! -L "$candidate" && -x "$candidate" ]]; then
+            candidates+=("$candidate")
+        fi
+    done
+    shopt -u nullglob
+
+    ((${#candidates[@]} == 1)) || die "release archive must contain exactly one executable automation-gateway-led-linux-* binary; found ${#candidates[@]}"
+    SOURCE_BINARY="$(readlink -f -- "${candidates[0]}")"
+    log "using bundled release binary $SOURCE_BINARY"
 }
 
 build_binary() {
@@ -109,7 +132,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$SOURCE_BINARY" ]]; then
-    build_binary
+    if ! select_bundled_release_binary; then
+        build_binary
+    fi
 fi
 require_regular "$SOURCE_BINARY"
 require_regular "$COMPONENT_DIR/config.example.yaml"

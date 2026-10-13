@@ -79,6 +79,7 @@ func TestPackageReleaseBuildsMinimalLinuxBundle(t *testing.T) {
 
 	gotLEDEntries := tarGzipEntries(t, ledArchivePath)
 	wantLEDEntries := []string{
+		"automation-gateway-led/INSTALL.txt",
 		"automation-gateway-led/LICENSE",
 		"automation-gateway-led/README.md",
 		"automation-gateway-led/THIRD_PARTY_LICENSES.md",

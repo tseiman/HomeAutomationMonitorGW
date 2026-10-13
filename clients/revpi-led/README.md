@@ -134,10 +134,10 @@ After a successful checksum verification:
 INSTALL_DIR="$(mktemp -d /tmp/automation-gateway-led-install.XXXXXX)"
 tar -xzf "$ARCHIVE" -C "$INSTALL_DIR"
 cd "$INSTALL_DIR/automation-gateway-led"
-sudo ./install.sh --binary="$INSTALL_DIR/automation-gateway-led/automation-gateway-led-linux-armv7"
+sudo ./install.sh
 ```
 
-Configure and start it only after validating the concrete RevPi hardware as described above.
+Inside the release archive, the installer detects the adjacent prebuilt `automation-gateway-led-linux-<arch>` binary automatically. No local Go installation or module download is required; `--binary=PATH` remains available as an explicit override. Configure and start the client only after validating the concrete RevPi hardware as described above.
 
 ## Configuration
 

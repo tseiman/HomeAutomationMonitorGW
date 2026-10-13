@@ -166,6 +166,7 @@ EOF_INSTALL
 copy_led_material() {
     local binary="$1"
     local destination="$2"
+    local install_text="$destination/INSTALL.txt"
 
     install -d -m 0755 "$destination/systemd"
     install -m 0755 "$binary" "$destination/$LED_BINARY_NAME"
@@ -175,6 +176,19 @@ copy_led_material() {
     install -m 0644 "$PROJECT_ROOT/clients/revpi-led/README.md" "$destination/README.md"
     install -m 0644 "$PROJECT_ROOT/clients/revpi-led/THIRD_PARTY_LICENSES.md" "$destination/THIRD_PARTY_LICENSES.md"
     install -m 0644 "$PROJECT_ROOT/LICENSE" "$destination/LICENSE"
+    cat > "$install_text" <<EOF_LED_INSTALL
+HomeAutomationMonitorGW optional RevPi LED client $VERSION for Linux $ARCH_LABEL
+
+Verify the adjacent release checksum before extracting this archive.
+From the extracted automation-gateway-led directory install the prebuilt binary with:
+
+  sudo ./install.sh
+
+The release installer detects the adjacent $LED_BINARY_NAME automatically;
+Go is not required on the target. --binary remains available as an explicit override.
+Configure the HTTPS SSE URL and separately provisioned token before using --start.
+EOF_LED_INSTALL
+    chmod 0644 "$install_text"
 }
 
 build_windows_package_if_supported() {

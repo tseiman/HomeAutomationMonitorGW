@@ -63,6 +63,62 @@ func TestInstallerIsSyntacticallyValidAndKeepsClientOptional(t *testing.T) {
 	}
 }
 
+func TestReleaseArchiveUsesBundledBinaryWithoutGo(t *testing.T) {
+	component := componentDirectory(t)
+	archiveRoot := t.TempDir()
+	fakeBin := filepath.Join(t.TempDir(), "bin")
+	state := t.TempDir()
+	for _, directory := range []string{fakeBin, filepath.Join(archiveRoot, "systemd")} {
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	copyTestFile(t, filepath.Join(component, "install.sh"), filepath.Join(archiveRoot, "install.sh"), 0o755)
+	copyTestFile(t, filepath.Join(component, "config.example.yaml"), filepath.Join(archiveRoot, "config.example.yaml"), 0o644)
+	copyTestFile(t, filepath.Join(component, "systemd/automation-gateway-led.service"), filepath.Join(archiveRoot, "systemd/automation-gateway-led.service"), 0o644)
+	writeTestFile(t, filepath.Join(archiveRoot, "INSTALL.txt"), "release archive\n", 0o644)
+	writeTestFile(t, filepath.Join(archiveRoot, "automation-gateway-led-linux-armv7"), "#!/bin/sh\nexit 0\n", 0o755)
+	writeTestFile(t, filepath.Join(fakeBin, "go"), "#!/bin/sh\n: > \"${LED_INSTALL_TEST_STATE:?}/go-invoked\"\nexit 97\n", 0o755)
+	writeTestFile(t, filepath.Join(fakeBin, "id"), "#!/bin/sh\n[ \"$1\" = -u ] && printf '1000\\n'\n", 0o755)
+	writeTestFile(t, filepath.Join(fakeBin, "sudo"), "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${LED_INSTALL_TEST_STATE:?}/sudo-args\"\n", 0o755)
+
+	cmd := exec.Command("bash", filepath.Join(archiveRoot, "install.sh"))
+	cmd.Env = append(os.Environ(), "LED_INSTALL_TEST_STATE="+state, "PATH="+fakeBin+":"+os.Getenv("PATH"))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("LED release installer failed without --binary: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "using bundled release binary") {
+		t.Fatalf("installer did not report bundled binary selection:\n%s", output)
+	}
+	if _, err := os.Stat(filepath.Join(state, "go-invoked")); !os.IsNotExist(err) {
+		t.Fatalf("LED release installer invoked Go: %v\n%s", err, output)
+	}
+	sudoArgs, err := os.ReadFile(filepath.Join(state, "sudo-args"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sudoArgs), filepath.Join(archiveRoot, "automation-gateway-led-linux-armv7")) {
+		t.Fatalf("sudo invocation did not receive bundled binary:\n%s", sudoArgs)
+	}
+}
+
+func copyTestFile(t *testing.T, source, target string, mode os.FileMode) {
+	t.Helper()
+	content, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, target, string(content), mode)
+}
+
+func writeTestFile(t *testing.T, path, content string, mode os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func componentDirectory(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
