@@ -208,6 +208,40 @@ type sseFrame struct {
 	Comment string
 }
 
+type deadlineRecordingWriter struct {
+	header    http.Header
+	deadlines []time.Time
+}
+
+func (w *deadlineRecordingWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (*deadlineRecordingWriter) WriteHeader(int)                {}
+func (*deadlineRecordingWriter) Write(body []byte) (int, error) { return len(body), nil }
+func (*deadlineRecordingWriter) Flush()                         {}
+func (w *deadlineRecordingWriter) SetWriteDeadline(deadline time.Time) error {
+	w.deadlines = append(w.deadlines, deadline)
+	return nil
+}
+
+func TestSSEWriteClearsPerWriteDeadlineAfterFlush(t *testing.T) {
+	writer := &deadlineRecordingWriter{}
+	controller := http.NewResponseController(writer)
+	if err := writeStatusEvent(writer, controller, statusmodel.Snapshot{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(writer.deadlines) != 2 {
+		t.Fatalf("write deadlines=%v, want bounded deadline followed by clear", writer.deadlines)
+	}
+	if writer.deadlines[0].IsZero() || !writer.deadlines[1].IsZero() {
+		t.Fatalf("write deadlines=%v, want non-zero then zero", writer.deadlines)
+	}
+}
+
 func readSSEFrame(reader *bufio.Reader) (sseFrame, error) {
 	var frame sseFrame
 	for {

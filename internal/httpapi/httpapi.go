@@ -340,7 +340,7 @@ func (a *API) statusEvents(w http.ResponseWriter, r *http.Request, hub *statusmo
 			if _, err := fmt.Fprint(w, ": heartbeat\n\n"); err != nil {
 				return
 			}
-			if err := controller.Flush(); err != nil {
+			if err := flushStreamWrite(controller); err != nil {
 				return
 			}
 		}
@@ -358,11 +358,19 @@ func writeStatusEvent(w http.ResponseWriter, controller *http.ResponseController
 	if _, err := fmt.Fprintf(w, "id: %s\nevent: status\ndata: %s\n\n", strconv.FormatUint(snapshot.Sequence, 10), body); err != nil {
 		return err
 	}
-	return controller.Flush()
+	return flushStreamWrite(controller)
 }
 
 func prepareStreamWrite(controller *http.ResponseController) error {
 	return controller.SetWriteDeadline(time.Now().Add(5 * time.Second))
+}
+
+// flushStreamWrite completes one bounded write and clears its deadline while the stream is idle.
+func flushStreamWrite(controller *http.ResponseController) error {
+	if err := controller.Flush(); err != nil {
+		return err
+	}
+	return controller.SetWriteDeadline(time.Time{})
 }
 
 // writeJSON sends code and JSON-encodes value; encoding errors cannot be returned after headers commit.
