@@ -10,9 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -78,14 +80,78 @@ type Logging struct {
 
 // Source configures one independently named, optionally disabled collector instance.
 type Source struct {
-	Name         string      `yaml:"name"`
-	Driver       string      `yaml:"driver"`
-	Enabled      bool        `yaml:"enabled"`
-	PollInterval Duration    `yaml:"poll_interval"`
-	StaleAfter   Duration    `yaml:"stale_after"`
-	Timeout      Duration    `yaml:"timeout"`
-	NUT          *NUTSource  `yaml:"nut,omitempty"`
-	SNMP         *SNMPSource `yaml:"snmp,omitempty"`
+	Name         string           `yaml:"name"`
+	Driver       string           `yaml:"driver"`
+	Enabled      bool             `yaml:"enabled"`
+	PollInterval Duration         `yaml:"poll_interval"`
+	StaleAfter   Duration         `yaml:"stale_after"`
+	Timeout      Duration         `yaml:"timeout"`
+	NUT          *NUTSource       `yaml:"nut,omitempty"`
+	SNMP         *SNMPSource      `yaml:"snmp,omitempty"`
+	ModbusRTU    *ModbusRTUSource `yaml:"modbus_rtu,omitempty"`
+}
+
+// ModbusRTUSource describes one read-only RTU slave and its static metrics.
+type ModbusRTUSource struct {
+	Device          string           `yaml:"device"`
+	BaudRate        int              `yaml:"baud_rate"`
+	DataBits        int              `yaml:"data_bits"`
+	Parity          string           `yaml:"parity"`
+	StopBits        int              `yaml:"stop_bits"`
+	ResponseTimeout Duration         `yaml:"response_timeout"`
+	Retries         int              `yaml:"retries"`
+	SlaveID         uint8            `yaml:"slave_id"`
+	BundleReads     bool             `yaml:"bundle_reads"`
+	MaxBlockSize    uint16           `yaml:"max_block_size"`
+	Registers       []ModbusRegister `yaml:"registers"`
+	bundleReadsSet  bool
+}
+
+// ModbusRegister maps one zero-based PDU address to a typed metric.
+type ModbusRegister struct {
+	Name        string  `yaml:"name"`
+	Address     uint16  `yaml:"address"`
+	Function    uint8   `yaml:"function"`
+	Type        string  `yaml:"type"`
+	WordOrder   string  `yaml:"word_order"`
+	ByteOrder   string  `yaml:"byte_order"`
+	Scale       float64 `yaml:"scale"`
+	Offset      float64 `yaml:"offset"`
+	Unit        string  `yaml:"unit"`
+	Description string  `yaml:"description"`
+	scaleSet    bool
+}
+
+// UnmarshalYAML records whether read bundling was explicitly disabled.
+func (m *ModbusRTUSource) UnmarshalYAML(node *yaml.Node) error {
+	type plain ModbusRTUSource
+	var decoded plain
+	if err := node.Decode(&decoded); err != nil {
+		return err
+	}
+	*m = ModbusRTUSource(decoded)
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == "bundle_reads" {
+			m.bundleReadsSet = true
+		}
+	}
+	return nil
+}
+
+// UnmarshalYAML records whether scale was supplied so zero remains a valid factor.
+func (r *ModbusRegister) UnmarshalYAML(node *yaml.Node) error {
+	type plain ModbusRegister
+	var decoded plain
+	if err := node.Decode(&decoded); err != nil {
+		return err
+	}
+	*r = ModbusRegister(decoded)
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == "scale" {
+			r.scaleSet = true
+		}
+	}
+	return nil
 }
 
 // NUTSource contains Network UPS Tools endpoint and UPS selection settings.
@@ -172,11 +238,13 @@ func (s *Source) UnmarshalYAML(node *yaml.Node) error {
 // validateSourceKeys rejects unknown source and nested driver keys even when a source is disabled.
 func validateSourceKeys(node *yaml.Node) error {
 	allowed := map[string]map[string]struct{}{
-		"source":    keys("name", "driver", "enabled", "poll_interval", "stale_after", "timeout", "nut", "snmp"),
-		"nut":       keys("server", "ups"),
-		"snmp":      keys("address", "port", "max_oids_per_request", "oids", "security", "discovery", "metadata_file"),
-		"security":  keys("version", "username", "auth_protocol", "auth_passphrase_file", "privacy_protocol", "privacy_passphrase_file"),
-		"discovery": keys("enabled", "root_oids", "max_objects", "timeout"),
+		"source":     keys("name", "driver", "enabled", "poll_interval", "stale_after", "timeout", "nut", "snmp", "modbus_rtu"),
+		"nut":        keys("server", "ups"),
+		"snmp":       keys("address", "port", "max_oids_per_request", "oids", "security", "discovery", "metadata_file"),
+		"security":   keys("version", "username", "auth_protocol", "auth_passphrase_file", "privacy_protocol", "privacy_passphrase_file"),
+		"discovery":  keys("enabled", "root_oids", "max_objects", "timeout"),
+		"modbus_rtu": keys("device", "baud_rate", "data_bits", "parity", "stop_bits", "response_timeout", "retries", "slave_id", "bundle_reads", "max_block_size", "registers"),
+		"register":   keys("name", "address", "function", "type", "word_order", "byte_order", "scale", "offset", "unit", "description"),
 	}
 	if err := validateMappingKeys(node, "source", allowed["source"]); err != nil {
 		return err
@@ -202,6 +270,25 @@ func validateSourceKeys(node *yaml.Node) error {
 				if (nestedName == "security" || nestedName == "discovery") && nested.Kind == yaml.MappingNode {
 					if err := validateMappingKeys(nested, nestedName, allowed[nestedName]); err != nil {
 						return err
+					}
+				}
+			}
+		case "modbus_rtu":
+			if value.Kind != yaml.MappingNode {
+				continue
+			}
+			if err := validateMappingKeys(value, "modbus_rtu", allowed["modbus_rtu"]); err != nil {
+				return err
+			}
+			for j := 0; j+1 < len(value.Content); j += 2 {
+				if value.Content[j].Value != "registers" || value.Content[j+1].Kind != yaml.SequenceNode {
+					continue
+				}
+				for _, register := range value.Content[j+1].Content {
+					if register.Kind == yaml.MappingNode {
+						if err := validateMappingKeys(register, "modbus_rtu.register", allowed["register"]); err != nil {
+							return err
+						}
 					}
 				}
 			}
@@ -460,6 +547,39 @@ func (c *Config) defaults() {
 				source.SNMP.Discovery.Timeout.Duration = 2 * time.Minute
 			}
 		}
+		if source.ModbusRTU != nil {
+			modbus := source.ModbusRTU
+			if modbus.BaudRate == 0 {
+				modbus.BaudRate = 9600
+			}
+			if modbus.DataBits == 0 {
+				modbus.DataBits = 8
+			}
+			if modbus.Parity == "" {
+				modbus.Parity = "N"
+			}
+			if modbus.StopBits == 0 {
+				modbus.StopBits = 1
+			}
+			if !modbus.ResponseTimeout.set && modbus.ResponseTimeout.Duration == 0 {
+				modbus.ResponseTimeout.Duration = time.Second
+			}
+			if !modbus.bundleReadsSet {
+				modbus.BundleReads = true
+			}
+			for index := range modbus.Registers {
+				register := &modbus.Registers[index]
+				if register.WordOrder == "" {
+					register.WordOrder = "high_low"
+				}
+				if register.ByteOrder == "" {
+					register.ByteOrder = "big"
+				}
+				if !register.scaleSet {
+					register.Scale = 1
+				}
+			}
+		}
 	}
 }
 
@@ -527,6 +647,15 @@ func (c Config) Validate() error {
 		return errors.New("server.max_header_bytes must be between 1024 and 1048576")
 	}
 	seenNames := map[string]struct{}{}
+	type serialParameters struct {
+		baudRate, dataBits, stopBits int
+		parity                       string
+	}
+	type physicalBus struct {
+		parameters serialParameters
+		sourceName string
+	}
+	physicalBuses := map[string]physicalBus{}
 	for index, source := range c.Sources {
 		if !source.Enabled {
 			continue
@@ -539,13 +668,23 @@ func (c Config) Validate() error {
 			return fmt.Errorf("duplicate source name %q", source.Name)
 		}
 		seenNames[source.Name] = struct{}{}
-		if source.Driver != "nut" && source.Driver != "snmp" {
-			return fmt.Errorf("%s.driver must be nut or snmp", path)
+		if source.Driver != "nut" && source.Driver != "snmp" && source.Driver != "modbus_rtu" {
+			return fmt.Errorf("%s.driver must be nut, snmp, or modbus_rtu", path)
 		}
-		if (source.NUT == nil) == (source.SNMP == nil) {
-			return fmt.Errorf("%s must contain exactly one of nut or snmp", path)
+		configured := 0
+		if source.NUT != nil {
+			configured++
 		}
-		if source.Driver == "nut" && source.NUT == nil || source.Driver == "snmp" && source.SNMP == nil {
+		if source.SNMP != nil {
+			configured++
+		}
+		if source.ModbusRTU != nil {
+			configured++
+		}
+		if configured != 1 {
+			return fmt.Errorf("%s must contain exactly one of nut, snmp, or modbus_rtu", path)
+		}
+		if source.Driver == "nut" && source.NUT == nil || source.Driver == "snmp" && source.SNMP == nil || source.Driver == "modbus_rtu" && source.ModbusRTU == nil {
 			return fmt.Errorf("%s must contain exactly the matching driver configuration", path)
 		}
 		if err := validateTimes(source.PollInterval.Duration, source.StaleAfter.Duration, path); err != nil {
@@ -563,6 +702,18 @@ func (c Config) Validate() error {
 			}
 			continue
 		}
+		if source.Driver == "modbus_rtu" {
+			if err := validateModbusRTUSource(path, *source.ModbusRTU); err != nil {
+				return err
+			}
+			identity := canonicalDevicePath(source.ModbusRTU.Device)
+			parameters := serialParameters{source.ModbusRTU.BaudRate, source.ModbusRTU.DataBits, source.ModbusRTU.StopBits, source.ModbusRTU.Parity}
+			if existing, ok := physicalBuses[identity]; ok && existing.parameters != parameters {
+				return fmt.Errorf("%s.modbus_rtu has conflicting serial parameters with source %q on physical bus %q", path, existing.sourceName, identity)
+			}
+			physicalBuses[identity] = physicalBus{parameters, source.Name}
+			continue
+		}
 		if err := validateSNMPSource(path, *source.SNMP); err != nil {
 			return err
 		}
@@ -571,6 +722,135 @@ func (c Config) Validate() error {
 	case "debug", "info", "warn", "error":
 	default:
 		return errors.New("logging.level must be debug, info, warn, or error")
+	}
+	return nil
+}
+
+// canonicalDevicePath returns a stable bus identity without requiring the device target to exist.
+// Existing links are resolved normally; a final dangling /dev/serial/by-id-style link is also resolved.
+func canonicalDevicePath(device string) string {
+	absolute, err := filepath.Abs(filepath.Clean(device))
+	if err != nil {
+		absolute = filepath.Clean(device)
+	}
+	if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
+		return filepath.Clean(resolved)
+	}
+	current := absolute
+	for links := 0; links < 40; links++ {
+		info, err := os.Lstat(current)
+		if err != nil || info.Mode()&os.ModeSymlink == 0 {
+			break
+		}
+		target, err := os.Readlink(current)
+		if err != nil {
+			break
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(current), target)
+		}
+		current = filepath.Clean(target)
+	}
+	return current
+}
+
+func modbusRegisterWidth(dataType string) (uint32, bool) {
+	switch dataType {
+	case "bool", "uint16", "int16":
+		return 1, true
+	case "uint32", "int32", "float32":
+		return 2, true
+	case "uint64", "int64", "float64":
+		return 4, true
+	default:
+		return 0, false
+	}
+}
+
+// validateModbusRTUSource validates serial framing and non-overlapping PDU spans.
+func validateModbusRTUSource(path string, source ModbusRTUSource) error {
+	prefix := path + ".modbus_rtu"
+	if source.Device == "" {
+		return fmt.Errorf("%s.device is required", prefix)
+	}
+	if source.BaudRate < 300 || source.BaudRate > 4000000 {
+		return fmt.Errorf("%s.baud_rate must be between 300 and 4000000", prefix)
+	}
+	if source.DataBits < 5 || source.DataBits > 8 {
+		return fmt.Errorf("%s.data_bits must be between 5 and 8", prefix)
+	}
+	if source.Parity != "N" && source.Parity != "E" && source.Parity != "O" {
+		return fmt.Errorf("%s.parity must be N, E, or O", prefix)
+	}
+	if source.StopBits != 1 && source.StopBits != 2 {
+		return fmt.Errorf("%s.stop_bits must be 1 or 2", prefix)
+	}
+	if err := validateDuration(prefix+".response_timeout", source.ResponseTimeout.Duration, 5*time.Minute); err != nil {
+		return err
+	}
+	if source.Retries < 0 || source.Retries > 10 {
+		return fmt.Errorf("%s.retries must be between 0 and 10", prefix)
+	}
+	if source.SlaveID == 0 || source.SlaveID > 247 {
+		return fmt.Errorf("%s.slave_id must be between 1 and 247", prefix)
+	}
+	if source.MaxBlockSize > 2000 {
+		return fmt.Errorf("%s.max_block_size must not exceed 2000", prefix)
+	}
+	if len(source.Registers) == 0 {
+		return fmt.Errorf("%s.registers must not be empty", prefix)
+	}
+	names := map[string]struct{}{}
+	type span struct {
+		function   uint8
+		start, end uint32
+		name       string
+	}
+	spans := make([]span, 0, len(source.Registers))
+	for index, register := range source.Registers {
+		registerPath := fmt.Sprintf("%s.registers[%d]", prefix, index)
+		if !validSourceName(register.Name) {
+			return fmt.Errorf("%s.name must be a safe 1-64 character name", registerPath)
+		}
+		if _, exists := names[register.Name]; exists {
+			return fmt.Errorf("%s: duplicate metric name %q", prefix, register.Name)
+		}
+		names[register.Name] = struct{}{}
+		width, ok := modbusRegisterWidth(register.Type)
+		if !ok {
+			return fmt.Errorf("%s.type is unsupported", registerPath)
+		}
+		if source.MaxBlockSize > 0 && uint32(source.MaxBlockSize) < width {
+			return fmt.Errorf("%s.max_block_size is smaller than metric %q width", prefix, register.Name)
+		}
+		if register.Type == "bool" {
+			if register.Function != 1 && register.Function != 2 {
+				return fmt.Errorf("%s.function must be function 1 or 2 for bool", registerPath)
+			}
+		} else if register.Function != 3 && register.Function != 4 {
+			return fmt.Errorf("%s.function must be function 3 or 4 for numeric types", registerPath)
+		}
+		end := uint32(register.Address) + width
+		if end > 65536 {
+			return fmt.Errorf("%s address span exceeds zero-based PDU address space", registerPath)
+		}
+		if register.WordOrder != "high_low" && register.WordOrder != "low_high" {
+			return fmt.Errorf("%s.word_order must be high_low or low_high", registerPath)
+		}
+		if register.ByteOrder != "big" && register.ByteOrder != "little" {
+			return fmt.Errorf("%s.byte_order must be big or little", registerPath)
+		}
+		if math.IsNaN(register.Scale) || math.IsInf(register.Scale, 0) || math.IsNaN(register.Offset) || math.IsInf(register.Offset, 0) {
+			return fmt.Errorf("%s scale and offset must be finite", registerPath)
+		}
+		spans = append(spans, span{register.Function, uint32(register.Address), end, register.Name})
+	}
+	for i := range spans {
+		for j := i + 1; j < len(spans); j++ {
+			if spans[i].function == spans[j].function && spans[i].start < spans[j].end && spans[j].start < spans[i].end {
+				return fmt.Errorf("%s registers %q and %q overlap", prefix, spans[i].name, spans[j].name)
+			}
+		}
 	}
 	return nil
 }

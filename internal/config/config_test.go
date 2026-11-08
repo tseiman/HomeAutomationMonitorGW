@@ -405,3 +405,149 @@ func TestLoadFilesRejectsUnknownOverlayFields(t *testing.T) {
 		t.Fatalf("strict overlay error=%v", err)
 	}
 }
+
+func modbusYAML(token string) string {
+	return baseYAML([]string{token}, []string{"127.0.0.1"}) + `sources:
+  - name: sirax-dc
+    driver: modbus_rtu
+    poll_interval: 10s
+    stale_after: 30s
+    modbus_rtu:
+      device: /dev/serial/by-id/usb-test
+      baud_rate: 9600
+      data_bits: 8
+      parity: N
+      stop_bits: 1
+      response_timeout: 750ms
+      retries: 2
+      slave_id: 1
+      bundle_reads: false
+      max_block_size: 16
+      registers:
+        - name: voltage
+          address: 72
+          function: 4
+          type: float32
+          word_order: low_high
+          byte_order: big
+          unit: V
+          description: DC voltage
+        - name: current
+          address: 74
+          function: 4
+          type: float32
+          word_order: low_high
+          scale: 0.0001
+          unit: A
+        - name: status
+          address: 71
+          function: 3
+          type: uint16
+`
+}
+
+func TestLoadModbusRTUSchemaDefaultsAndExplicitValues(t *testing.T) {
+	directory := t.TempDir()
+	token := writeSecret(t, directory, "token", "test-token-value")
+	got, err := Load(writeConfigFile(t, directory, modbusYAML(token)), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	modbus := got.Sources[0].ModbusRTU
+	if modbus == nil || modbus.Device != "/dev/serial/by-id/usb-test" || modbus.ResponseTimeout.Duration != 750*time.Millisecond || modbus.BundleReads || modbus.MaxBlockSize != 16 {
+		t.Fatalf("modbus config=%+v", modbus)
+	}
+	if len(modbus.Registers) != 3 || modbus.Registers[0].Scale != 1 || modbus.Registers[0].Offset != 0 || modbus.Registers[2].WordOrder != "high_low" || modbus.Registers[2].ByteOrder != "big" {
+		t.Fatalf("register defaults=%+v", modbus.Registers)
+	}
+
+	body := modbusYAML(token)
+	for _, line := range []string{
+		"      data_bits: 8\n", "      parity: N\n", "      stop_bits: 1\n", "      response_timeout: 750ms\n",
+		"      retries: 2\n", "      bundle_reads: false\n", "      max_block_size: 16\n",
+	} {
+		body = strings.Replace(body, line, "", 1)
+	}
+	got, err = Load(writeConfigFile(t, directory, body), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	modbus = got.Sources[0].ModbusRTU
+	if modbus.BaudRate != 9600 || modbus.DataBits != 8 || modbus.Parity != "N" || modbus.StopBits != 1 || modbus.ResponseTimeout.Duration != time.Second || modbus.Retries != 0 || !modbus.BundleReads || modbus.MaxBlockSize != 0 {
+		t.Fatalf("modbus defaults=%+v", modbus)
+	}
+}
+
+func TestModbusRTUValidationRejectsInvalidDefinitions(t *testing.T) {
+	directory := t.TempDir()
+	token := writeSecret(t, directory, "token", "test-token-value")
+	base := modbusYAML(token)
+	for _, tc := range []struct {
+		name, old, replacement, contains string
+	}{
+		{"duplicate metric", "        - name: current", "        - name: voltage", "duplicate metric"},
+		{"bool register function", "          type: uint16", "          type: bool", "function 1 or 2"},
+		{"numeric bit function", "          function: 3\n          type: uint16", "          function: 1\n          type: uint16", "function 3 or 4"},
+		{"unknown type", "          type: uint16", "          type: text", "type"},
+		{"invalid word order", "          word_order: low_high", "          word_order: middle", "word_order"},
+		{"invalid byte order", "          byte_order: big", "          byte_order: middle", "byte_order"},
+		{"span overflow", "          address: 72", "          address: 65535", "span"},
+		{"overlap", "          address: 74", "          address: 73", "overlap"},
+		{"non-finite scale", "          scale: 0.0001", "          scale: .inf", "finite"},
+		{"zero slave", "      slave_id: 1", "      slave_id: 0", "slave_id"},
+		{"invalid parity", "      parity: N", "      parity: X", "parity"},
+		{"protocol block limit", "      max_block_size: 16", "      max_block_size: 2001", "max_block_size"},
+		{"block smaller than metric", "      max_block_size: 16", "      max_block_size: 1", "max_block_size"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.Replace(base, tc.old, tc.replacement, 1)
+			_, err := Load(writeConfigFile(t, directory, body), false)
+			if err == nil || !strings.Contains(err.Error(), tc.contains) {
+				t.Fatalf("error=%v, want containing %q", err, tc.contains)
+			}
+		})
+	}
+}
+
+func TestModbusRTURejectsUnknownNestedKeys(t *testing.T) {
+	directory := t.TempDir()
+	token := writeSecret(t, directory, "token", "test-token-value")
+	body := strings.Replace(modbusYAML(token), "      device: /dev/serial/by-id/usb-test", "      device: /dev/serial/by-id/usb-test\n      typo: true", 1)
+	if _, err := Load(writeConfigFile(t, directory, body), false); err == nil || !strings.Contains(err.Error(), "typo") {
+		t.Fatalf("unknown Modbus field accepted: %v", err)
+	}
+	body = strings.Replace(modbusYAML(token), "          address: 72", "          address: 72\n          typo: true", 1)
+	if _, err := Load(writeConfigFile(t, directory, body), false); err == nil || !strings.Contains(err.Error(), "typo") {
+		t.Fatalf("unknown register field accepted: %v", err)
+	}
+}
+
+func TestModbusRTURejectsConflictingSerialParametersOnSamePhysicalBus(t *testing.T) {
+	directory := t.TempDir()
+	token := writeSecret(t, directory, "token", "test-token-value")
+	first := filepath.Join(directory, "missing-tty")
+	alias := filepath.Join(directory, "serial-alias")
+	if err := os.Symlink(first, alias); err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Replace(modbusYAML(token), "/dev/serial/by-id/usb-test", first, 1)
+	second := strings.Replace(strings.TrimPrefix(modbusYAML(token), baseYAML([]string{token}, []string{"127.0.0.1"})+"sources:\n"), "sirax-dc", "second-slave", 1)
+	second = strings.Replace(second, "/dev/serial/by-id/usb-test", alias, 1)
+	second = strings.Replace(second, "      baud_rate: 9600", "      baud_rate: 19200", 1)
+	body += second
+	if _, err := Load(writeConfigFile(t, directory, body), false); err == nil || !strings.Contains(err.Error(), "conflicting serial parameters") {
+		t.Fatalf("conflicting physical bus accepted: %v", err)
+	}
+}
+
+func TestModbusRTUAllowsMultipleSlavesWithMatchingSerialParameters(t *testing.T) {
+	directory := t.TempDir()
+	token := writeSecret(t, directory, "token", "test-token-value")
+	body := modbusYAML(token)
+	second := strings.Replace(strings.TrimPrefix(modbusYAML(token), baseYAML([]string{token}, []string{"127.0.0.1"})+"sources:\n"), "sirax-dc", "second-slave", 1)
+	second = strings.Replace(second, "      slave_id: 1", "      slave_id: 2", 1)
+	body += second
+	if _, err := Load(writeConfigFile(t, directory, body), false); err != nil {
+		t.Fatalf("matching shared bus rejected: %v", err)
+	}
+}
