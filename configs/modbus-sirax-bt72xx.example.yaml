@@ -1,0 +1,176 @@
+# SIRAX BT72xx read-only DC example.
+#
+# Confirmed on the BT7250:
+# - register 40008 read back as 0x0003 (DC mode)
+# - internal current- and voltage-transformer factors are both 1.0
+# - FC03, low_high 16-bit word order, and big byte order within each register
+# - ten conductor passes run opposite to the meter's measurement direction
+#
+# The negative current/power scales compensate both the opposite pass direction
+# and ten passes. Energy uses a POSITIVE 0.1 scale: it is divided by ten but is
+# deliberately not sign-inverted. Do not apply the same correction in the
+# device and gateway; exactly one scaling layer is allowed.
+#
+# DEVICE CHECKS REQUIRED BEFORE PRODUCTION:
+# - confirm the actual baud/framing/slave ID (9600 8N1, slave 1 below is provisional)
+# - confirm total-energy count direction/sign
+# - confirm positive/negative energy-counter behavior for the installed wiring
+# - confirm native-UART RS485 direction control or use an adapter that handles it
+#
+# The gateway only issues configured read functions FC01-FC04. This example uses
+# FC03 exclusively. It never writes or configures the SIRAX.
+server:
+  listen: "127.0.0.1:8443"
+  certificate: "/etc/automation-gateway/tls/server.crt"
+  private_key: "/etc/automation-gateway/tls/server.key"
+
+authentication:
+  bearer_token_files:
+    - "/etc/automation-gateway/tokens/zabbix"
+  allowed_clients:
+    - "127.0.0.1"
+
+logging:
+  level: "info"
+
+sources:
+  - name: "sirax-dc"
+    driver: "modbus_rtu"
+    enabled: true
+    poll_interval: "10s"
+    stale_after: "30s"
+    timeout: "5s"
+    modbus_rtu:
+      # Replace with the host's stable adapter identity.
+      device: "/dev/serial/by-id/usb-RS485_adapter-example"
+      # Provisional until checked on the installed device.
+      baud_rate: 9600
+      data_bits: 8
+      parity: "N"
+      stop_bits: 1
+      response_timeout: "750ms"
+      retries: 2
+      slave_id: 1
+      bundle_reads: true
+      max_block_size: 24
+      registers:
+        - name: "status"
+          address: 71
+          function: 3
+          type: "uint16"
+          word_order: "low_high"
+          byte_order: "big"
+          scale: 1
+          offset: 0
+          unit: ""
+          description: "SIRAX DC measurement status word. Interpret bits only against the exact device manual."
+        - name: "voltage"
+          address: 72
+          function: 3
+          type: "float32"
+          word_order: "low_high"
+          byte_order: "big"
+          scale: 1
+          offset: 0
+          unit: "V"
+          description: "DC voltage; internal voltage-transformer factor is 1.0."
+        - name: "current"
+          address: 74
+          function: 3
+          type: "float32"
+          word_order: "low_high"
+          byte_order: "big"
+          scale: -0.0001
+          offset: 0
+          unit: "A"
+          description: "DC current corrected for ten opposite-direction conductor passes; raw device value is in mA."
+        - name: "power_active"
+          address: 76
+          function: 3
+          type: "float32"
+          word_order: "low_high"
+          byte_order: "big"
+          scale: -0.1
+          offset: 0
+          unit: "W"
+          description: "Active DC power corrected for ten opposite-direction conductor passes."
+        - name: "power_reactive"
+          address: 78
+          function: 3
+          type: "float32"
+          word_order: "low_high"
+          byte_order: "big"
+          scale: -0.1
+          offset: 0
+          unit: "var"
+          description: "Reactive power corrected for ten opposite-direction conductor passes."
+        - name: "power_apparent"
+          address: 80
+          function: 3
+          type: "float32"
+          word_order: "low_high"
+          byte_order: "big"
+          scale: -0.1
+          offset: 0
+          unit: "VA"
+          description: "Apparent power corrected for ten opposite-direction conductor passes."
+        - name: "power_factor"
+          address: 82
+          function: 3
+          type: "float32"
+          word_order: "low_high"
+          byte_order: "big"
+          scale: 1
+          offset: 0
+          unit: ""
+          description: "Power factor reported by the SIRAX."
+        - name: "frequency"
+          address: 84
+          function: 3
+          type: "float32"
+          word_order: "low_high"
+          byte_order: "big"
+          scale: 1
+          offset: 0
+          unit: "Hz"
+          description: "Frequency reported by the SIRAX."
+        - name: "thd"
+          address: 86
+          function: 3
+          type: "float32"
+          word_order: "low_high"
+          byte_order: "big"
+          scale: 1
+          offset: 0
+          unit: ""
+          description: "Total harmonic distortion reported by the SIRAX."
+        - name: "energy_total"
+          address: 88
+          function: 3
+          type: "float32"
+          word_order: "low_high"
+          byte_order: "big"
+          scale: 0.1
+          offset: 0
+          unit: "kWh"
+          description: "Total energy divided by ten for conductor passes; positive scale, never sign-inverted. Count direction remains a device check."
+        - name: "energy_positive"
+          address: 90
+          function: 3
+          type: "float32"
+          word_order: "low_high"
+          byte_order: "big"
+          scale: 0.1
+          offset: 0
+          unit: "kWh"
+          description: "Positive energy counter divided by ten; positive scale. Installed-device counter behavior remains to be confirmed."
+        - name: "energy_negative"
+          address: 92
+          function: 3
+          type: "float32"
+          word_order: "low_high"
+          byte_order: "big"
+          scale: 0.1
+          offset: 0
+          unit: "kWh"
+          description: "Negative energy counter divided by ten; positive scale. Installed-device counter behavior remains to be confirmed."

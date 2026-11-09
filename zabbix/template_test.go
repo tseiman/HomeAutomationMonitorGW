@@ -238,7 +238,7 @@ func TestDiscoveryJavaScriptTransformsSnapshot(t *testing.T) {
 	if err := yaml.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	snapshot := `{"controller-main":{"driver":"snmp","available":true,"stale":false,"last_success":"2026-10-04T00:00:00Z","metrics":[{"name":"sysUpTime","value":123,"value_type":"counter","unit":"centiseconds","timestamp":"2026-10-04T00:00:00Z","labels":{"oid":"1.3.6.1.2.1.1.3.0"}},{"name":"display.name","value":"device","value_type":"string","timestamp":"2026-10-04T00:00:00Z"}]}}`
+	snapshot := `{"controller-main":{"driver":"snmp","available":true,"stale":false,"last_success":"2026-10-04T00:00:00Z","unavailable_since":"0001-01-01T00:00:00Z","metrics":[{"name":"sysUpTime","value":123,"value_type":"counter","unit":"centiseconds","description":"SNMP uptime","timestamp":"2026-10-04T00:00:00Z","labels":{"oid":"1.3.6.1.2.1.1.3.0"}},{"name":"display.name","value":"device","value_type":"string","timestamp":"2026-10-04T00:00:00Z"}]},"sirax-dc":{"driver":"modbus_rtu","available":true,"stale":false,"last_success":"2026-10-04T00:00:00Z","unavailable_since":"0001-01-01T00:00:00Z","metrics":[{"name":"status","value":3,"value_type":"integer","description":"DC measurement status","timestamp":"2026-10-04T00:00:00Z"},{"name":"voltage","value":23.54,"value_type":"number","unit":"V","description":"DC voltage","timestamp":"2026-10-04T00:00:00Z"}]}}`
 	for _, rule := range document.Export.Templates[0].DiscoveryRules {
 		script := "const value = process.argv[1]; function transform() {\n" + rule.Preprocessing[0].Parameters[0] + "\n} process.stdout.write(transform());"
 		output, err := exec.Command(node, "-e", script, snapshot).CombinedOutput()
@@ -254,7 +254,7 @@ func TestDiscoveryJavaScriptTransformsSnapshot(t *testing.T) {
 		}
 		switch rule.Key {
 		case "automation.gateway.sources.discovery":
-			if len(discovered) != 1 || discovered[0]["{#SOURCEPATH}"] != `$["controller-main"]` {
+			if len(discovered) != 2 || discovered[0]["{#SOURCEPATH}"] != `$["controller-main"]` || discovered[1]["{#DRIVER}"] != "modbus_rtu" {
 				t.Fatalf("source discovery=%v", discovered)
 			}
 		case "automation.gateway.metrics.discovery":
@@ -269,12 +269,31 @@ func TestDiscoveryJavaScriptTransformsSnapshot(t *testing.T) {
 				t.Fatalf("name metric=%v", byID["display.name"])
 			}
 		case "automation.gateway.numeric_metrics.discovery":
-			if len(discovered) != 1 {
+			if len(discovered) != 3 {
 				t.Fatalf("numeric metric discovery=%v", discovered)
 			}
-			metric := discovered[0]
-			if metric["{#METRIC_ID}"] != "1.3.6.1.2.1.1.3.0" || metric["{#VALUE_JSONPATH}"] != `$["controller-main"].metrics[?(@.labels.oid == "1.3.6.1.2.1.1.3.0")].value.first()` || !regexp.MustCompile(`^[0-9a-f]+$`).MatchString(metric["{#METRIC_KEY}"].(string)) {
+			byIdentity := map[string]map[string]any{}
+			keys := map[string]bool{}
+			for _, metric := range discovered {
+				identity := metric["{#SOURCE}"].(string) + "/" + metric["{#METRIC_ID}"].(string)
+				key := metric["{#SOURCE}"].(string) + "/" + metric["{#METRIC_KEY}"].(string)
+				if byIdentity[identity] != nil || keys[key] {
+					t.Fatalf("duplicate numeric discovery identity: %v", metric)
+				}
+				byIdentity[identity] = metric
+				keys[key] = true
+			}
+			metric := byIdentity["controller-main/1.3.6.1.2.1.1.3.0"]
+			if metric["{#VALUE_JSONPATH}"] != `$["controller-main"].metrics[?(@.labels.oid == "1.3.6.1.2.1.1.3.0")].value.first()` || !regexp.MustCompile(`^[0-9a-f]+$`).MatchString(metric["{#METRIC_KEY}"].(string)) {
 				t.Fatalf("numeric OID metric=%v", metric)
+			}
+			voltage := byIdentity["sirax-dc/voltage"]
+			if voltage["{#VALUE_TYPE}"] != "number" || voltage["{#DISPLAY_UNIT}"] != "V" || voltage["{#DESCRIPTION}"] != "DC voltage" || voltage["{#MULTIPLIER}"] != "1" {
+				t.Fatalf("Modbus voltage discovery=%v", voltage)
+			}
+			status := byIdentity["sirax-dc/status"]
+			if status["{#VALUE_TYPE}"] != "integer" || status["{#DESCRIPTION}"] != "DC measurement status" {
+				t.Fatalf("Modbus status discovery=%v", status)
 			}
 		default:
 			t.Fatalf("unexpected discovery key %q", rule.Key)

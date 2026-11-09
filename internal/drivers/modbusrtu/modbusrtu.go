@@ -34,15 +34,26 @@ func RegisterWidth(dataType string) (uint16, error) {
 	}
 }
 
-// DecodeBool decodes a bit value only for the bit-reading function codes.
-func DecodeBool(definition config.ModbusRegister, value bool) (bool, error) {
+// DecodeBool decodes a bit as raw 0/1, then applies physical = raw*scale+offset.
+func DecodeBool(definition config.ModbusRegister, value bool) (float64, error) {
 	if definition.Type != "bool" {
-		return false, fmt.Errorf("metric %q is not bool", definition.Name)
+		return 0, fmt.Errorf("metric %q is not bool", definition.Name)
 	}
 	if definition.Function != 1 && definition.Function != 2 {
-		return false, fmt.Errorf("bool metric %q requires function 1 or 2", definition.Name)
+		return 0, fmt.Errorf("bool metric %q requires function 1 or 2", definition.Name)
 	}
-	return value, nil
+	if !finite(definition.Scale) || !finite(definition.Offset) {
+		return 0, fmt.Errorf("metric %q contains a non-finite value", definition.Name)
+	}
+	raw := float64(0)
+	if value {
+		raw = 1
+	}
+	physical := raw*definition.Scale + definition.Offset
+	if !finite(physical) {
+		return 0, fmt.Errorf("metric %q scaling produced a non-finite value", definition.Name)
+	}
+	return physical, nil
 }
 
 // DecodeRegisters decodes a numeric value, then applies physical = raw*scale+offset.
@@ -94,9 +105,17 @@ func DecodeRegisters(definition config.ModbusRegister, registers []uint16) (floa
 	case "float32":
 		raw = float64(math.Float32frombits(binary.BigEndian.Uint32(data)))
 	case "uint64":
-		raw = float64(binary.BigEndian.Uint64(data))
+		value := binary.BigEndian.Uint64(data)
+		if value > 1<<53 {
+			return 0, fmt.Errorf("metric %q uint64 value exceeds exact JSON integer range", definition.Name)
+		}
+		raw = float64(value)
 	case "int64":
-		raw = float64(int64(binary.BigEndian.Uint64(data)))
+		value := int64(binary.BigEndian.Uint64(data))
+		if value < -(1<<53) || value > 1<<53 {
+			return 0, fmt.Errorf("metric %q int64 value exceeds exact JSON integer range", definition.Name)
+		}
+		raw = float64(value)
 	case "float64":
 		raw = math.Float64frombits(binary.BigEndian.Uint64(data))
 	default:
@@ -118,15 +137,18 @@ func finite(value float64) bool { return !math.IsNaN(value) && !math.IsInf(value
 func Definitions(registers []config.ModbusRegister) []metrics.Definition {
 	definitions := make([]metrics.Definition, len(registers))
 	for index, register := range registers {
-		valueType := "integer"
-		if register.Type == "float32" || register.Type == "float64" {
-			valueType = "number"
-		}
 		definitions[index] = metrics.Definition{
-			Name: register.Name, Type: valueType, Unit: register.Unit, Description: register.Description,
+			Name: register.Name, Type: metricValueType(register), Unit: register.Unit, Description: register.Description,
 		}
 	}
 	return definitions
+}
+
+func metricValueType(register config.ModbusRegister) string {
+	if register.Type == "float32" || register.Type == "float64" || !finite(register.Scale) || !finite(register.Offset) || math.Trunc(register.Scale) != register.Scale || math.Trunc(register.Offset) != register.Offset {
+		return "number"
+	}
+	return "integer"
 }
 
 type plannedMetric struct {

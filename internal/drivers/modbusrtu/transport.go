@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	modbus "github.com/aldas/go-modbus-client"
@@ -203,6 +204,11 @@ func canonicalBusPath(device string) string {
 	if err != nil {
 		cleaned = filepath.Clean(device)
 	}
+	if info, err := os.Stat(cleaned); err == nil && info.Mode()&os.ModeDevice != 0 {
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+			return fmt.Sprintf("rdev:%d", uint64(stat.Rdev))
+		}
+	}
 	if resolved, err := filepath.EvalSymlinks(cleaned); err == nil {
 		return filepath.Clean(resolved)
 	}
@@ -259,7 +265,29 @@ func (s *serialSession) SetResponseTimeout(timeout time.Duration) error {
 func (s *serialSession) Close() error { return s.port.Close() }
 
 func (s *serialSession) do(ctx context.Context, request packet.Request) (packet.Response, error) {
-	client := modbus.NewSerialClient(flushingPort{s.port}, modbus.WithSerialReadTimeout(s.timeout))
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	timeout := s.timeout
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, context.DeadlineExceeded
+		}
+		if timeout <= 0 || remaining < timeout {
+			timeout = remaining
+		}
+	}
+	if timeout <= 0 {
+		return nil, errors.New("serial response timeout must be positive")
+	}
+	if err := s.port.SetReadTimeout(timeout); err != nil {
+		return nil, fmt.Errorf("set serial read timeout: %w", err)
+	}
+	client := modbus.NewSerialClient(flushingPort{s.port}, modbus.WithSerialReadTimeout(timeout))
 	return client.Do(ctx, request)
 }
 

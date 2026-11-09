@@ -76,7 +76,7 @@ func TestCollectorExecutesPlannedBlocksDecodesBitsAndAllRegisterValues(t *testin
 	if len(got) != 5 {
 		t.Fatalf("metrics=%+v", got)
 	}
-	wantValues := []any{int64(1), int64(0), float64(42), float64(-100), float64(12.5)}
+	wantValues := []any{float64(1), float64(0), float64(42), float64(-100), float64(12.5)}
 	wantTypes := []string{"integer", "integer", "integer", "integer", "number"}
 	for i := range got {
 		if got[i].Name != []string{"coil_a", "coil_b", "status", "temperature", "voltage"}[i] || !reflect.DeepEqual(got[i].Value, wantValues[i]) || got[i].ValueType != wantTypes[i] || got[i].Timestamp != at {
@@ -85,6 +85,34 @@ func TestCollectorExecutesPlannedBlocksDecodesBitsAndAllRegisterValues(t *testin
 	}
 	if got[4].Unit != "V" || len(transport.calls) != 2 {
 		t.Fatalf("metrics=%+v calls=%v", got, transport.calls)
+	}
+}
+
+func TestCollectorEmitsScaledBoolAndIntegerAsNumbersWhenFractionsArePossible(t *testing.T) {
+	contact := register("contact", 10, 1, "bool")
+	contact.Scale = 0.5
+	contact.Offset = 0.25
+	count := register("count", 20, 3, "uint16")
+	count.WordOrder = "high_low"
+	count.ByteOrder = "big"
+	count.Scale = 0.5
+	transport := &fakeReadTransport{responses: map[readKey][]byte{
+		{1, 9, 10, 1}: {1},
+		{3, 9, 20, 1}: {0, 3},
+	}, errors: map[readKey]error{}}
+	collector, err := NewCollector(transport, collectorSource(contact, count))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := collector.Poll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantValues := []float64{0.75, 1.5}
+	for index := range got {
+		if got[index].ValueType != "number" || got[index].Value != wantValues[index] {
+			t.Fatalf("metric[%d]=%+v, want value=%v type=number", index, got[index], wantValues[index])
+		}
 	}
 }
 

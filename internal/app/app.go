@@ -318,8 +318,11 @@ func (r *Runtime) Reload() error {
 	}
 	r.wg.Wait()
 	if err := closeResources(r.resources); err != nil {
-		_ = cand.close()
-		return fmt.Errorf("close old generation resources: %w", err)
+		logger := r.logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.Warn("old generation resource cleanup failed", "error", err)
 	}
 	r.resources = nil
 	if old != nil && old.status != nil {

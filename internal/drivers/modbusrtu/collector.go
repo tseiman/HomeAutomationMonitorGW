@@ -64,11 +64,7 @@ func (c *Collector) Poll(ctx context.Context) ([]metrics.Metric, error) {
 		if !ok {
 			return nil, fmt.Errorf("metric %q was not decoded", definition.Name)
 		}
-		valueType := "integer"
-		if definition.Type == "float32" || definition.Type == "float64" {
-			valueType = "number"
-		}
-		result = append(result, metrics.Metric{Name: definition.Name, Value: value, ValueType: valueType, Unit: definition.Unit, Description: definition.Description, Timestamp: at})
+		result = append(result, metrics.Metric{Name: definition.Name, Value: value, ValueType: metricValueType(definition), Unit: definition.Unit, Description: definition.Description, Timestamp: at})
 	}
 	return result, nil
 }
@@ -105,11 +101,7 @@ func (c *Collector) decodeBlock(block ReadBlock, data []byte, decoded map[string
 			if err != nil {
 				return err
 			}
-			if value {
-				decoded[name] = int64(1)
-			} else {
-				decoded[name] = int64(0)
-			}
+			decoded[name] = value
 		}
 		return nil
 	}

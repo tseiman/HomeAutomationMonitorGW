@@ -87,11 +87,98 @@ func TestDecodeRegistersAppliesScaleAndOffsetAndRejectsNonFinite(t *testing.T) {
 	}
 }
 
-func TestDecodeBoolOnlyAcceptsBitFunctions(t *testing.T) {
+func TestDecodeRegistersSIRAXDCMeasuredVectors(t *testing.T) {
+	tests := []struct {
+		name      string
+		registers []uint16
+		scale     float64
+		want      float64
+		tolerance float64
+	}{
+		{name: "voltage", registers: []uint16{0x51ec, 0x41bc}, scale: 1, want: 23.540, tolerance: 0.00001},
+		{name: "current", registers: []uint16{0x4c02, 0xc595}, scale: -0.0001, want: 0.4777501, tolerance: 0.0000001},
+		{name: "active power", registers: []uint16{0x3021, 0xc2e1}, scale: -0.1, want: 11.2594, tolerance: 0.00001},
+		{name: "apparent power", registers: []uint16{0xed91, 0xc2e0}, scale: -0.1, want: 11.2464, tolerance: 0.00001},
+		{name: "total energy uses positive scale", registers: []uint16{0x4a12, 0x3cdf}, scale: 0.1, want: 0.0027257, tolerance: 0.0000001},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			definition := register(tc.name, 0, 3, "float32")
+			definition.WordOrder = "low_high"
+			definition.ByteOrder = "big"
+			definition.Scale = tc.scale
+			got, err := DecodeRegisters(definition, tc.registers)
+			if err != nil || math.Abs(got-tc.want) > tc.tolerance {
+				t.Fatalf("DecodeRegisters()=(%.10g, %v), want %.10g ± %.1g", got, err, tc.want, tc.tolerance)
+			}
+		})
+	}
+}
+
+func TestDecodeRegistersPreservesGenericNegativeValues(t *testing.T) {
+	definition := register("generic-negative", 0, 3, "float32")
+	definition.WordOrder = "low_high"
+	definition.ByteOrder = "big"
+	got, err := DecodeRegisters(definition, []uint16{0x3021, 0xc2e1})
+	if err != nil || math.Abs(got-(-112.594)) > 0.00001 {
+		t.Fatalf("DecodeRegisters()=(%v, %v), want a preserved negative value", got, err)
+	}
+}
+
+func TestDecodeRegistersRejects64BitIntegersOutsideExactFloatRange(t *testing.T) {
+	words := func(bits uint64) []uint16 {
+		return []uint16{uint16(bits >> 48), uint16(bits >> 32), uint16(bits >> 16), uint16(bits)}
+	}
+	for _, tc := range []struct {
+		name     string
+		dataType string
+		bits     uint64
+		want     float64
+		wantErr  bool
+	}{
+		{name: "uint safe boundary", dataType: "uint64", bits: 1 << 53, want: 1 << 53},
+		{name: "uint first unsafe", dataType: "uint64", bits: 1<<53 + 1, wantErr: true},
+		{name: "uint maximum", dataType: "uint64", bits: math.MaxUint64, wantErr: true},
+		{name: "int negative safe boundary", dataType: "int64", bits: ^uint64((1 << 53) - 1), want: -(1 << 53)},
+		{name: "int first unsafe negative", dataType: "int64", bits: ^uint64(1 << 53), wantErr: true},
+		{name: "int minimum", dataType: "int64", bits: 1 << 63, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			definition := register("counter", 0, 3, tc.dataType)
+			definition.WordOrder = "high_low"
+			definition.ByteOrder = "big"
+			got, err := DecodeRegisters(definition, words(tc.bits))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("DecodeRegisters()=%v, want rejection", got)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("DecodeRegisters()=(%v, %v), want (%v, nil)", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestDecodeBoolAppliesScaleAndOffsetAndRejectsNonFinite(t *testing.T) {
 	definition := register("contact", 9, 1, "bool")
-	got, err := DecodeBool(definition, true)
-	if err != nil || !got {
-		t.Fatalf("DecodeBool()=(%v, %v)", got, err)
+	definition.Scale = 0.5
+	definition.Offset = 0.25
+	for raw, want := range map[bool]float64{false: 0.25, true: 0.75} {
+		got, err := DecodeBool(definition, raw)
+		if err != nil || got != want {
+			t.Fatalf("DecodeBool(%v)=(%v, %v), want (%v, nil)", raw, got, err, want)
+		}
+	}
+	definition.Scale = math.Inf(1)
+	if _, err := DecodeBool(definition, true); err == nil {
+		t.Fatal("non-finite bool scaling accepted")
+	}
+	definition.Scale = math.MaxFloat64
+	definition.Offset = math.MaxFloat64
+	if _, err := DecodeBool(definition, true); err == nil {
+		t.Fatal("non-finite bool result accepted")
 	}
 	definition.Function = 3
 	if _, err := DecodeBool(definition, true); err == nil {
@@ -107,6 +194,21 @@ func TestDefinitionsAreStaticAndPreserveMetadata(t *testing.T) {
 	})
 	if len(definitions) != 3 || definitions[0].OID != "" || definitions[0].Type != "integer" || definitions[1].Type != "integer" || definitions[2].Name != "voltage" || definitions[2].Type != "number" || definitions[2].Unit != "V" || definitions[2].Description != "DC voltage" {
 		t.Fatalf("definitions=%+v", definitions)
+	}
+}
+
+func TestDefinitionsUseNumberWhenIntegerScalingCanProduceFractions(t *testing.T) {
+	definitions := Definitions([]config.ModbusRegister{
+		{Name: "fractional_bool", Function: 1, Type: "bool", Scale: 0.5},
+		{Name: "fractional_integer", Function: 3, Type: "uint16", Scale: 1, Offset: 0.25},
+		{Name: "integral_bool", Function: 2, Type: "bool", Scale: -2, Offset: 1},
+		{Name: "integral_integer", Function: 4, Type: "int64", Scale: 3, Offset: -4},
+	})
+	want := []string{"number", "number", "integer", "integer"}
+	for index := range definitions {
+		if definitions[index].Type != want[index] {
+			t.Fatalf("definition[%d]=%+v, want type %q", index, definitions[index], want[index])
+		}
 	}
 }
 

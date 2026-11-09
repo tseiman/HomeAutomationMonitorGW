@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -25,8 +26,9 @@ import (
 )
 
 const (
-	maxBearerTokenFiles = 32
-	maxAllowedClients   = 128
+	maxBearerTokenFiles         = 32
+	maxAllowedClients           = 128
+	maxModbusRegistersPerSource = 512
 )
 
 // Duration wraps time.Duration with YAML text decoding.
@@ -733,6 +735,11 @@ func canonicalDevicePath(device string) string {
 	if err != nil {
 		absolute = filepath.Clean(device)
 	}
+	if info, err := os.Stat(absolute); err == nil && info.Mode()&os.ModeDevice != 0 {
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+			return fmt.Sprintf("rdev:%d", uint64(stat.Rdev))
+		}
+	}
 	if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
 		return filepath.Clean(resolved)
 	}
@@ -800,6 +807,9 @@ func validateModbusRTUSource(path string, source ModbusRTUSource) error {
 	if len(source.Registers) == 0 {
 		return fmt.Errorf("%s.registers must not be empty", prefix)
 	}
+	if len(source.Registers) > maxModbusRegistersPerSource {
+		return fmt.Errorf("%s.registers must contain at most %d entries", prefix, maxModbusRegistersPerSource)
+	}
 	names := map[string]struct{}{}
 	type span struct {
 		function   uint8
@@ -845,11 +855,16 @@ func validateModbusRTUSource(path string, source ModbusRTUSource) error {
 		}
 		spans = append(spans, span{register.Function, uint32(register.Address), end, register.Name})
 	}
-	for i := range spans {
-		for j := i + 1; j < len(spans); j++ {
-			if spans[i].function == spans[j].function && spans[i].start < spans[j].end && spans[j].start < spans[i].end {
-				return fmt.Errorf("%s registers %q and %q overlap", prefix, spans[i].name, spans[j].name)
-			}
+	sort.Slice(spans, func(i, j int) bool {
+		if spans[i].function != spans[j].function {
+			return spans[i].function < spans[j].function
+		}
+		return spans[i].start < spans[j].start
+	})
+	for index := 1; index < len(spans); index++ {
+		previous, current := spans[index-1], spans[index]
+		if previous.function == current.function && current.start < previous.end {
+			return fmt.Errorf("%s registers %q and %q overlap", prefix, previous.name, current.name)
 		}
 	}
 	return nil

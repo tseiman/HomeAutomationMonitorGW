@@ -6,6 +6,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -15,9 +16,11 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -306,15 +309,19 @@ func (r *lifecycleReader) ReadInputRegisters(ctx context.Context, _ uint8, _, _ 
 }
 
 type lifecycleBus struct {
-	reader modbusrtu.ReadTransport
-	closed chan struct{}
-	once   sync.Once
+	reader   modbusrtu.ReadTransport
+	closed   chan struct{}
+	closeErr error
+	once     sync.Once
 }
 
 func (b *lifecycleBus) Reader(config.ModbusRTUSource) (modbusrtu.ReadTransport, error) {
 	return b.reader, nil
 }
-func (b *lifecycleBus) Close() error { b.once.Do(func() { close(b.closed) }); return nil }
+func (b *lifecycleBus) Close() error {
+	b.once.Do(func() { close(b.closed) })
+	return b.closeErr
+}
 
 // TestReloadWaitsForOldTransactionsAndClosesBusBeforeNewPolling verifies generations never overlap on a serial port.
 func TestReloadWaitsForOldTransactionsAndClosesBusBeforeNewPolling(t *testing.T) {
@@ -382,6 +389,53 @@ func TestReloadWaitsForOldTransactionsAndClosesBusBeforeNewPolling(t *testing.T)
 	case err := <-violation:
 		t.Fatal(err)
 	default:
+	}
+}
+
+func TestReloadActivatesValidatedCandidateWhenOldResourceCloseFails(t *testing.T) {
+	directory := t.TempDir()
+	certificate, key := pair(t, directory, "reload-close-error", 11)
+	token := filepath.Join(directory, "token")
+	if err := os.WriteFile(token, []byte("reload-close-error-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configuration := filepath.Join(directory, "config.yaml")
+	writeModbusConfig(t, configuration, certificate, key, token, "voltage", 72)
+	firstReader := &lifecycleReader{started: make(chan struct{}), exited: make(chan struct{})}
+	firstBus := &lifecycleBus{reader: firstReader, closed: make(chan struct{}), closeErr: errors.New("old tty close failed")}
+	secondReader := &lifecycleReader{started: make(chan struct{}), exited: make(chan struct{})}
+	secondBus := &lifecycleBus{reader: secondReader, closed: make(chan struct{})}
+	buses := []modbusBus{firstBus, secondBus}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	runtime, err := newFilesWithDependencies([]string{configuration}, logger, dependencies{newModbusBus: func() modbusBus {
+		bus := buses[0]
+		buses = buses[1:]
+		return bus
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	select {
+	case <-firstReader.started:
+	case <-time.After(time.Second):
+		t.Fatal("old poll did not start")
+	}
+	oldStore := runtime.View().Store
+	if err := runtime.Reload(); err != nil {
+		t.Fatalf("reload returned ambiguous failure after stopping old generation: %v", err)
+	}
+	if runtime.View().Store == oldStore {
+		t.Fatal("validated candidate was not published")
+	}
+	select {
+	case <-secondReader.started:
+	case <-time.After(time.Second):
+		t.Fatal("validated candidate collectors were not started")
+	}
+	if !strings.Contains(logs.String(), "old tty close failed") {
+		t.Fatalf("cleanup warning not logged: %s", logs.String())
 	}
 }
 

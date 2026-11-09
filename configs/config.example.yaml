@@ -75,3 +75,8 @@ sources:
     enabled: false
     snmp:
       address: "not-configured-yet"
+
+# For a complete, independently parseable generic Modbus RTU source using the
+# exact schema, see modbus-sirax-bt72xx.example.yaml. Modbus register addresses
+# are zero-based PDU offsets. Only FC01-FC04 reads are supported; scale/offset
+# are applied once in the gateway, and API/SSE requests read only the cache.

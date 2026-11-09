@@ -1,12 +1,13 @@
 # HomeAutomationMonitorGW
 
-HomeAutomationMonitorGW is a small, read-only Linux monitoring gateway. It polls configured NUT and SNMPv3 sources, keeps the latest values in memory, and exposes them through an authenticated HTTPS/JSON API for systems such as Zabbix.
+HomeAutomationMonitorGW is a small, read-only Linux monitoring gateway. It polls configured NUT, SNMPv3, and generic Modbus RTU sources, keeps the latest values in memory, and exposes them through an authenticated HTTPS/JSON API for systems such as Zabbix.
 
-[![HomeAutomationMonitorGW architecture: SNMPv3 and NUT collectors feed an in-memory snapshot cache exposed through an authenticated read-only HTTPS REST API to Zabbix](docs/assets/homeautomationmonitorgw-architecture.png)](docs/assets/homeautomationmonitorgw-architecture.svg)
+[![Existing architecture view of the SNMPv3 and NUT paths; generic Modbus RTU is documented below](docs/assets/homeautomationmonitorgw-architecture.png)](docs/assets/homeautomationmonitorgw-architecture.svg)
 
 - HTTP requests never trigger device access.
 - SNMP uses configured GET/BulkWalk operations only; there is no SET path.
 - NUT uses `LIST VAR` only.
+- Modbus RTU exposes only FC01-FC04 reads; there is no write or device-configuration path.
 - Clients cannot supply device addresses, OIDs, or protocol commands.
 - One failed source does not stop other collectors; its last successful snapshot becomes stale.
 
@@ -20,6 +21,7 @@ HomeAutomationMonitorGW is a small, read-only Linux monitoring gateway. It polls
 - [Configuration](#configuration)
   - [NUT](#nut)
   - [SNMPv3](#snmpv3)
+  - [Generic Modbus RTU](#generic-modbus-rtu)
 - [MIB metadata with `mib2json`](#mib-metadata-with-mib2json)
   - [Which MIB files are needed?](#which-mib-files-are-needed)
 - [API and Zabbix](#api-and-zabbix)
@@ -34,7 +36,7 @@ HomeAutomationMonitorGW is a small, read-only Linux monitoring gateway. It polls
 
 **Gateway runtime**
 
-- Linux with systemd and standard Debian-family administration tools.
+- Linux with systemd and standard Debian-family administration tools. Modbus RTU additionally needs an operator-provisioned serial/RS485 interface.
 - No Go toolchain, Net-SNMP package, database, or CGO runtime is required.
 - NUT (`nut-server`; `nut-client` provides `upsc`) is required only when this host reads a locally attached UPS.
 - A TLS certificate and matching private key must be created or obtained separately, stored securely, and referenced in the configuration.
@@ -51,7 +53,7 @@ HomeAutomationMonitorGW is a small, read-only Linux monitoring gateway. It polls
 - `snmptranslate` from the Debian `snmp` package: required only on the workstation that runs `mib2json`; it is not a gateway runtime dependency.
 - Node.js: optional, used only for additional Zabbix JavaScript tests.
 
-Go dependencies are pinned through `go.mod` and `go.sum`: GoSNMP for SNMPv3, `yaml.v3` for strict YAML parsing, and the optional RevPi LED client's `gopicontrol` hardware adapter.
+Go dependencies are pinned through `go.mod` and `go.sum`: GoSNMP for SNMPv3, `go-modbus-client` plus `go.bug.st/serial` for Modbus RTU, `yaml.v3` for strict YAML parsing, and the optional RevPi LED client's `gopicontrol` hardware adapter. See [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for notices and reproduced license texts.
 
 ## Build and installation
 
@@ -213,9 +215,11 @@ The raw binary and both portable SHA-256 files contain only relative filenames. 
 ```text
 automation-gateway/INSTALL.txt
 automation-gateway/LICENSE
+automation-gateway/THIRD_PARTY_LICENSES.md
 automation-gateway/automation-gateway-linux-arm64
 automation-gateway/configs/config.example.yaml
 automation-gateway/configs/mib-metadata.example.json
+automation-gateway/configs/modbus-sirax-bt72xx.example.yaml
 automation-gateway/scripts/install.sh
 automation-gateway/systemd/automation-gateway.service
 ```
@@ -351,11 +355,11 @@ git push origin v1.2.3
 GitHub Actions then:
 
 1. checks out the tagged commit with full tag history;
-2. runs the Go tests once;
+2. runs all Go tests and `go vet`, selected race-enabled tests, and explicit CGO-disabled ARMv7/ARM64 gateway cross-build checks;
 3. builds `amd64`, `arm64`, `armv7`/Debian `armhf`, and `386`/Debian `i386` in parallel;
 4. runs `package_release.sh <architecture> --deb` for each architecture;
 5. creates or updates the GitHub Release named after the tag;
-6. uploads raw binaries, checksums, minimal `tar.gz` archives, optional Windows ZIPs if supported in the future, and `.deb` packages.
+6. uploads raw binaries, checksums, minimal `tar.gz` archives, optional Windows ZIPs if supported in the future, `.deb` packages, and one top-level copy each of `LICENSE` and `THIRD_PARTY_LICENSES.md`.
 
 Because the build runs at the exact tag, `automation-gateway --version` contains that tag instead of the normal short hash. The workflow uses GitHub's scoped `GITHUB_TOKEN` with explicit `contents: write`; no personal access token is required.
 
@@ -366,7 +370,7 @@ sha256sum -c automation-gateway_1.2.3_arm64.deb.sha256
 sudo apt install ./automation-gateway_1.2.3_arm64.deb
 ```
 
-The Debian package installs the binary under `/usr/sbin`, installs a matching systemd unit, creates the restricted service account and configuration directories, rejects symlinked or non-regular configuration targets, and copies example configuration only when no site file exists. It intentionally does not enable, start, or restart the service automatically. Finish configuration and provisioning, then run:
+The Debian package installs the binary under `/usr/sbin`, installs a matching systemd unit, creates the restricted service account and configuration directories, rejects symlinked or non-regular configuration targets, and copies example configuration only when no site file exists. It also ships the SIRAX example and third-party notices under `/usr/share`. It intentionally does not enable, start, or restart the service automatically. Finish configuration and provisioning, then run:
 
 ```bash
 sudo systemctl enable --now automation-gateway
@@ -388,7 +392,7 @@ Start with [`configs/config.example.yaml`](configs/config.example.yaml). Importa
 - `server.certificate`, `server.private_key`: securely stored TLS files; the installer never creates or changes them.
 - `authentication.bearer_token_files`: protected token files containing 16–4096 non-whitespace bytes.
 - `authentication.allowed_clients`: exact client IPs or canonical CIDRs; forwarding headers are ignored.
-- `sources[].driver`: `nut` or `snmp`.
+- `sources[].driver`: `nut`, `snmp`, or `modbus_rtu`.
 - `sources[].poll_interval`, `stale_after`, `timeout`: bounded source timing.
 - `sources[].nut.ups`: exact upsd UPS name.
 - `sources[].snmp.oids`: fixed normal-poll OID allowlist.
@@ -465,6 +469,44 @@ sudo journalctl -fu automation-gateway
 - Keep each OID only once. Duplicate entries waste device request capacity.
 - Keep legacy SHA1/DES devices isolated inside the automation network.
 - Do not treat a username such as `readonly` as proof that the device rejects writes; gateway safety comes from network policy and the absence of write code.
+
+### Generic Modbus RTU
+
+Start from the independently valid generic schema in [`configs/config.example.yaml`](configs/config.example.yaml), or the complete SIRAX DC deployment candidate in [`configs/modbus-sirax-bt72xx.example.yaml`](configs/modbus-sirax-bt72xx.example.yaml). Modbus addresses in configuration are **zero-based PDU addresses**: use the address sent on the wire, not a vendor's one-based `4xxxx` display number.
+
+The implementation is intentionally read-only:
+
+- only FC01 coils, FC02 discrete inputs, FC03 holding registers, and FC04 input registers are available;
+- `bool` is valid only with FC01/FC02; `uint16`, `int16`, `uint32`, `int32`, `float32`, `uint64`, `int64`, and `float64` are valid only with FC03/FC04;
+- there is no FC05/06/15/16 interface, passthrough command, device setup, or API-triggered bus access;
+- generic signed values remain signed. A negative `scale` changes sign only for a specifically documented installation correction.
+
+For multi-register values, `word_order` is `high_low` or `low_high`, and `byte_order` is `big` or `little` within each 16-bit register. The published value is `raw * scale + offset`, including FC01/FC02 values where `false` is raw `0` and `true` is raw `1`. Raw values, `scale`, `offset`, and the result must all be finite; NaN and infinities reject the complete poll. `uint64` and `int64` decode exactly before conversion, and runtime integer values outside the exact JSON/`float64` range `[-2^53, 2^53]` are explicitly rejected rather than rounded. Values inside that range remain supported; use another path when larger exact counter values are required.
+
+`bundle_reads: true` combines only touching, non-overlapping values with the same function code. Each source is limited to 512 configured register/bit definitions so validation and polling plans remain bounded on embedded gateways. `max_block_size` can reduce a bundle; zero uses the protocol maximum (2000 bits for FC01/02, 125 registers for FC03/04). One metric may never exceed the configured maximum. Gaps, different function codes, and the block limit create separate transactions.
+
+`response_timeout` applies to each bus attempt and `retries` is the number of additional attempts (`retries: 2` means at most three attempts). The source-level `timeout` bounds the complete collector poll. A poll is atomic: every planned block must read and decode successfully before a new snapshot is published. On failure, no partial values replace the cache; the last-known-good snapshot remains visible and becomes unavailable/stale according to collector health and `stale_after`.
+
+Multiple `modbus_rtu` sources may address different slaves on one physical serial bus. The gateway canonicalizes device paths, serializes transactions on the shared bus, and rejects conflicting baud/data/parity/stop settings for aliases of the same device. Each source keeps its own slave ID, response timeout, retries, poll health, and snapshot. Prefer `/dev/serial/by-id/...` over unstable `/dev/ttyUSB0` names.
+
+The service remains unprivileged. The shipped unit leaves explicit host devices visible, but Unix device permissions still decide access. Add `automation-gateway` to the **actual group of the configured tty** (commonly `dialout`) or assign a dedicated udev group; the package does not guess or add either automatically:
+
+```bash
+stat -Lc '%U %G %a %n' /dev/serial/by-id/<adapter>
+sudo usermod -a -G <actual-tty-group> automation-gateway
+# Group membership is captured at process start:
+sudo systemctl restart automation-gateway
+```
+
+A service restart is required after group membership changes. USB adapters normally handle RS485 transmit direction themselves. A native UART needs externally configured RS485 direction/RTS behavior appropriate to its driver and transceiver; the gateway does not configure GPIOs, overlays, termination, biasing, or direction control.
+
+A successful `SIGHUP`/`systemctl reload` builds and validates a replacement collector set before publishing it. Serial sessions from the old set are then closed. Listen address and server timeout changes still require restart. The HTTPS API and SSE routes are cache-only: requests never initiate serial traffic. Modbus definitions provide static discovery metadata without opening the tty. The generic Zabbix source-health and numeric LLD rules consume `integer`/`number`, units, descriptions, and stable source/metric-derived keys, retaining numeric trends without a device-specific duplicate discovery rule.
+
+#### SIRAX BT7250 DC example
+
+The separate SIRAX example records the confirmed installation facts: configuration register `40008` read back as `0x0003` (DC mode), internal current and voltage transformer factors are both `1.0`, FC03 works, and float32 values use `low_high` words with `big` bytes. Ten conductor passes run opposite to the measurement direction. Therefore current uses `-0.0001 A` and active/reactive/apparent power use `-0.1 W/var/VA`; voltage, power factor, frequency, and THD use scale `1`. Total, positive, and negative energy use **positive** `+0.1 kWh`: pass-count compensation applies, but energy is deliberately not sign-inverted. Do not configure the same transformer/pass correction in both the meter and gateway.
+
+The example's `9600 8N1`, slave `1` remains provisional. Before production, an operator must verify the real serial framing and slave ID, total-energy sign/count direction, positive/negative counter behavior, stable tty identity and permissions, RS485 termination/bias/direction, and readings against an independent reference. Validate configuration offline first, then roll out one read-only source with conservative polling and inspect cached values/health. The gateway performs no SIRAX writes or configuration; changing device mode or transformer factors is outside its scope.
 
 ## MIB metadata with `mib2json`
 
@@ -551,7 +593,7 @@ Every endpoint requires both an allowed TCP peer and a bearer token:
 
 ### Live gateway status and SSE
 
-`GET /api/v1/status` returns the current gateway and collector runtime state as one JSON snapshot. `GET /api/v1/status/events` provides the same complete snapshot as a Server-Sent Events (SSE) stream on the existing HTTPS listener. Both routes use the same TLS configuration, TCP-peer allowlist, and bearer-token authentication as every existing API route; they open no additional port and do not change the Zabbix endpoints.
+`GET /api/v1/status` returns the current gateway and collector runtime state as one JSON snapshot. `GET /api/v1/status/events` provides the same complete snapshot as a Server-Sent Events (SSE) stream on the existing HTTPS listener. Both routes use the same TLS configuration, TCP-peer allowlist, and bearer-token authentication as every existing API route; they open no additional port, do not change the Zabbix endpoints, and never poll NUT, SNMP, or Modbus devices on demand.
 
 A snapshot has this versioned shape:
 
@@ -590,7 +632,7 @@ Health and activity are independent dimensions. `health.code` uses the gateway's
 - `1` / `degraded`: a collector has not completed its first attempt or its last successful data is stale;
 - `2` / `failed`: a collector attempted a poll and is unavailable.
 
-The overall code is the highest collector code. This status describes gateway collection health; device-specific interpretations and thresholds in the Zabbix template continue to operate independently. `activity.active` becomes true immediately before a NUT or SNMP poll and false after its cache result is published. `activity.collectors` is sorted and can contain multiple names when polls overlap. `activity.poll_sequence` increases for every started poll and allows presentation clients to detect a very short poll even when bounded SSE notifications were coalesced before the client read them. If fresh cached data crosses its configured `stale_after` boundary while a poll is still running, the gateway publishes that health transition within 250 ms instead of waiting for the poll to finish.
+The overall code is the highest collector code. This status describes gateway collection health; device-specific interpretations and thresholds in the Zabbix template continue to operate independently. `activity.active` becomes true immediately before a NUT, SNMP, or Modbus poll and false after its cache result is published. `activity.collectors` is sorted and can contain multiple names when polls overlap. `activity.poll_sequence` increases for every started poll and allows presentation clients to detect a very short poll even when bounded SSE notifications were coalesced before the client read them. If fresh cached data crosses its configured `stale_after` boundary while a poll is still running, the gateway publishes that health transition within 250 ms instead of waiting for the poll to finish.
 
 The SSE connection sends an immediate `status` event and another complete snapshot whenever poll activity or collector health can change:
 
@@ -1009,4 +1051,4 @@ sudo systemctl restart automation-gateway
 
 ## License
 
-See [LICENSE](LICENSE).
+Project license: [LICENSE](LICENSE). Third-party dependency notices and reproduced Apache-2.0, BSD-style, and other applicable license texts: [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).

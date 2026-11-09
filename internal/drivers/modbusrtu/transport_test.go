@@ -3,16 +3,53 @@ package modbusrtu
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/config"
+	"go.bug.st/serial"
 )
+
+type timeoutPort struct {
+	mu          sync.Mutex
+	readTimeout time.Duration
+	timeouts    []time.Duration
+}
+
+func (*timeoutPort) SetMode(*serial.Mode) error { return nil }
+func (p *timeoutPort) Read([]byte) (int, error) {
+	p.mu.Lock()
+	timeout := p.readTimeout
+	p.mu.Unlock()
+	time.Sleep(timeout)
+	return 0, io.EOF
+}
+func (*timeoutPort) Write(data []byte) (int, error) { return len(data), nil }
+func (*timeoutPort) Drain() error                   { return nil }
+func (*timeoutPort) ResetInputBuffer() error        { return nil }
+func (*timeoutPort) ResetOutputBuffer() error       { return nil }
+func (*timeoutPort) SetDTR(bool) error              { return nil }
+func (*timeoutPort) SetRTS(bool) error              { return nil }
+func (*timeoutPort) GetModemStatusBits() (*serial.ModemStatusBits, error) {
+	return &serial.ModemStatusBits{}, nil
+}
+func (p *timeoutPort) SetReadTimeout(timeout time.Duration) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.readTimeout = timeout
+	p.timeouts = append(p.timeouts, timeout)
+	return nil
+}
+func (*timeoutPort) Close() error              { return nil }
+func (*timeoutPort) Break(time.Duration) error { return nil }
 
 type fakeSession struct {
 	mu         sync.Mutex
@@ -97,6 +134,26 @@ func TestBusManagerSharesBusAcrossSlavesAndSerializesTransactions(t *testing.T) 
 	}
 }
 
+func TestCanonicalBusPathUsesExistingDeviceRdev(t *testing.T) {
+	info, err := os.Stat("/dev/null")
+	if err != nil {
+		t.Skipf("/dev/null unavailable: %v", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("platform does not expose syscall.Stat_t")
+	}
+	want := fmt.Sprintf("rdev:%d", uint64(stat.Rdev))
+	for _, path := range []string{"/dev/null", "/proc/self/root/dev/null"} {
+		if _, err := os.Stat(path); err != nil {
+			t.Skipf("existing device alias %q unavailable: %v", path, err)
+		}
+		if got := canonicalBusPath(path); got != want {
+			t.Fatalf("canonicalBusPath(%q)=%q, want %q", path, got, want)
+		}
+	}
+}
+
 func TestBusManagerCanonicalizesDanglingDeviceAliases(t *testing.T) {
 	directory := t.TempDir()
 	target := filepath.Join(directory, "missing-tty")
@@ -154,6 +211,50 @@ func TestReaderRetriesWithReconnectAndHonorsResponseTimeout(t *testing.T) {
 	}
 	if atomic.LoadInt32(&first.closed) != 1 {
 		t.Fatalf("failed session closes=%d", first.closed)
+	}
+}
+
+func TestSerialSessionBoundsBlockingPortReadByContextDeadline(t *testing.T) {
+	port := &timeoutPort{readTimeout: time.Second}
+	session := &serialSession{port: port, timeout: time.Second}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := session.ReadHoldingRegisters(ctx, 1, 0, 1)
+	if err == nil {
+		t.Fatal("blocking serial read succeeded")
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("serial read ignored context deadline: %v", elapsed)
+	}
+	port.mu.Lock()
+	defer port.mu.Unlock()
+	if len(port.timeouts) == 0 || port.timeouts[len(port.timeouts)-1] <= 0 || port.timeouts[len(port.timeouts)-1] > 25*time.Millisecond {
+		t.Fatalf("serial read timeouts=%v, want a positive deadline-bounded timeout", port.timeouts)
+	}
+}
+
+func TestSerialSessionHandlesNoDeadlineAndExpiredDeadline(t *testing.T) {
+	port := &timeoutPort{readTimeout: time.Millisecond}
+	session := &serialSession{port: port, timeout: time.Millisecond}
+	if _, err := session.ReadHoldingRegisters(context.Background(), 1, 0, 1); err == nil {
+		t.Fatal("test port unexpectedly returned a valid Modbus response")
+	}
+	port.mu.Lock()
+	if len(port.timeouts) != 1 || port.timeouts[0] != time.Millisecond {
+		t.Fatalf("no-deadline timeouts=%v, want configured timeout", port.timeouts)
+	}
+	port.mu.Unlock()
+
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if _, err := session.ReadHoldingRegisters(expired, 1, 0, 1); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired deadline error=%v", err)
+	}
+	port.mu.Lock()
+	defer port.mu.Unlock()
+	if len(port.timeouts) != 1 {
+		t.Fatalf("expired request touched port timeouts=%v", port.timeouts)
 	}
 }
 

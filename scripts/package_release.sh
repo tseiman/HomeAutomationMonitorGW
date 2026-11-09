@@ -143,8 +143,10 @@ copy_linux_material() {
     install -m 0755 "$PROJECT_ROOT/scripts/install.sh" "$destination/scripts/install.sh"
     install -m 0644 "$PROJECT_ROOT/configs/config.example.yaml" "$destination/configs/config.example.yaml"
     install -m 0644 "$PROJECT_ROOT/configs/mib-metadata.example.json" "$destination/configs/mib-metadata.example.json"
+    install -m 0644 "$PROJECT_ROOT/configs/modbus-sirax-bt72xx.example.yaml" "$destination/configs/modbus-sirax-bt72xx.example.yaml"
     install -m 0644 "$PROJECT_ROOT/systemd/automation-gateway.service" "$destination/systemd/automation-gateway.service"
     install -m 0644 "$PROJECT_ROOT/LICENSE" "$destination/LICENSE"
+    install -m 0644 "$PROJECT_ROOT/THIRD_PARTY_LICENSES.md" "$destination/THIRD_PARTY_LICENSES.md"
     cat > "$install_text" <<EOF_INSTALL
 HomeAutomationMonitorGW $VERSION for Linux $ARCH_LABEL
 
@@ -261,6 +263,8 @@ build_debian_package() {
     install -m 0755 "$LINUX_BINARY_PATH" "$DEB_STAGE_DIR/usr/sbin/automation-gateway"
     install -m 0644 "$PROJECT_ROOT/configs/config.example.yaml" "$DEB_STAGE_DIR/usr/share/automation-gateway/config.example.yaml"
     install -m 0644 "$PROJECT_ROOT/configs/mib-metadata.example.json" "$DEB_STAGE_DIR/usr/share/automation-gateway/mib-metadata.example.json"
+    install -m 0644 "$PROJECT_ROOT/configs/modbus-sirax-bt72xx.example.yaml" "$DEB_STAGE_DIR/usr/share/automation-gateway/modbus-sirax-bt72xx.example.yaml"
+    install -m 0644 "$PROJECT_ROOT/THIRD_PARTY_LICENSES.md" "$DEB_STAGE_DIR/usr/share/doc/automation-gateway/THIRD_PARTY_LICENSES.md"
     install -m 0644 "$PROJECT_ROOT/LICENSE" "$DEB_STAGE_DIR/usr/share/doc/automation-gateway/copyright"
 
     unit_target="$DEB_STAGE_DIR/lib/systemd/system/automation-gateway.service"
@@ -282,8 +286,8 @@ Architecture: $DEB_ARCH
 Maintainer: aiAgentTseiman <ai-agent.tseiman@tseiman.de>
 Depends: adduser, systemd
 Description: Read-only home and industrial automation monitoring gateway
- Collects configured NUT and SNMPv3 metrics into an authenticated HTTPS cache
- for monitoring systems such as Zabbix.
+ Collects configured NUT, SNMPv3, and Modbus RTU metrics into an authenticated
+ HTTPS cache for monitoring systems such as Zabbix.
 EOF_CONTROL
     chmod 0644 "$control"
 

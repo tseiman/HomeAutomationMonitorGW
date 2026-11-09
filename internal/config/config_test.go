@@ -301,6 +301,46 @@ func TestExampleConfigurationParses(t *testing.T) {
 	}
 }
 
+func TestSIRAXBT72xxExampleParsesWithConfirmedDCScaling(t *testing.T) {
+	got, err := Load("../../configs/modbus-sirax-bt72xx.example.yaml", false)
+	if err != nil {
+		t.Fatalf("SIRAX example configuration: %v", err)
+	}
+	if len(got.Sources) != 1 || got.Sources[0].Name != "sirax-dc" || got.Sources[0].Driver != "modbus_rtu" || got.Sources[0].ModbusRTU == nil {
+		t.Fatalf("SIRAX sources=%+v", got.Sources)
+	}
+	modbus := got.Sources[0].ModbusRTU
+	want := []struct {
+		name     string
+		address  uint16
+		dataType string
+		scale    float64
+		unit     string
+	}{
+		{"status", 71, "uint16", 1, ""},
+		{"voltage", 72, "float32", 1, "V"},
+		{"current", 74, "float32", -0.0001, "A"},
+		{"power_active", 76, "float32", -0.1, "W"},
+		{"power_reactive", 78, "float32", -0.1, "var"},
+		{"power_apparent", 80, "float32", -0.1, "VA"},
+		{"power_factor", 82, "float32", 1, ""},
+		{"frequency", 84, "float32", 1, "Hz"},
+		{"thd", 86, "float32", 1, ""},
+		{"energy_total", 88, "float32", 0.1, "kWh"},
+		{"energy_positive", 90, "float32", 0.1, "kWh"},
+		{"energy_negative", 92, "float32", 0.1, "kWh"},
+	}
+	if len(modbus.Registers) != len(want) || modbus.SlaveID != 1 || modbus.BaudRate != 9600 || modbus.DataBits != 8 || modbus.Parity != "N" || modbus.StopBits != 1 {
+		t.Fatalf("SIRAX Modbus settings=%+v", modbus)
+	}
+	for index, expected := range want {
+		register := modbus.Registers[index]
+		if register.Name != expected.name || register.Address != expected.address || register.Type != expected.dataType || register.Unit != expected.unit || register.Function != 3 || register.WordOrder != "low_high" || register.ByteOrder != "big" || register.Scale != expected.scale || register.Offset != 0 {
+			t.Errorf("register[%d]=%+v, want name=%q address=%d type=%q unit=%q function=3 word_order=low_high byte_order=big scale=%v offset=0", index, register, expected.name, expected.address, expected.dataType, expected.unit, expected.scale)
+		}
+	}
+}
+
 // TestReadSecretRejectsUnsafeFilesAndContent verifies no-follow, regular-file, size, and control-character safeguards.
 func TestReadSecretRejectsUnsafeFilesAndContent(t *testing.T) {
 	d := t.TempDir()
@@ -519,6 +559,43 @@ func TestModbusRTURejectsUnknownNestedKeys(t *testing.T) {
 	body = strings.Replace(modbusYAML(token), "          address: 72", "          address: 72\n          typo: true", 1)
 	if _, err := Load(writeConfigFile(t, directory, body), false); err == nil || !strings.Contains(err.Error(), "typo") {
 		t.Fatalf("unknown register field accepted: %v", err)
+	}
+}
+
+func TestModbusRTURejectsMoreThanEmbeddedSafeRegisterLimit(t *testing.T) {
+	registers := make([]ModbusRegister, maxModbusRegistersPerSource+1)
+	for index := range registers {
+		registers[index] = ModbusRegister{
+			Name: fmt.Sprintf("metric_%d", index), Address: uint16(index), Function: 3,
+			Type: "uint16", WordOrder: "high_low", ByteOrder: "big", Scale: 1,
+		}
+	}
+	source := ModbusRTUSource{
+		Device: "/dev/example", BaudRate: 9600, DataBits: 8, Parity: "N", StopBits: 1,
+		ResponseTimeout: Duration{Duration: time.Second}, SlaveID: 1, Registers: registers,
+	}
+	if err := validateModbusRTUSource("sources[0]", source); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("at most %d", maxModbusRegistersPerSource)) {
+		t.Fatalf("register cap error=%v", err)
+	}
+}
+
+func TestCanonicalDevicePathUsesExistingDeviceRdev(t *testing.T) {
+	info, err := os.Stat("/dev/null")
+	if err != nil {
+		t.Skipf("/dev/null unavailable: %v", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("platform does not expose syscall.Stat_t")
+	}
+	want := fmt.Sprintf("rdev:%d", uint64(stat.Rdev))
+	for _, path := range []string{"/dev/null", "/proc/self/root/dev/null"} {
+		if _, err := os.Stat(path); err != nil {
+			t.Skipf("existing device alias %q unavailable: %v", path, err)
+		}
+		if got := canonicalDevicePath(path); got != want {
+			t.Fatalf("canonicalDevicePath(%q)=%q, want %q", path, got, want)
+		}
 	}
 }
 

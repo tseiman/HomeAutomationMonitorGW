@@ -20,6 +20,35 @@ import (
 	"testing"
 )
 
+func TestReleaseWorkflowUploadsTopLevelLicensesExactlyOnce(t *testing.T) {
+	root := projectRoot(t)
+	content, err := os.ReadFile(filepath.Join(root, ".github/workflows/release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(content)
+	releaseIndex := strings.Index(workflow, "\n  release:\n")
+	if releaseIndex < 0 {
+		t.Fatal("release job not found")
+	}
+	releaseJob := workflow[releaseIndex:]
+	fields := strings.Fields(releaseJob)
+	for _, asset := range []string{"LICENSE", "THIRD_PARTY_LICENSES.md"} {
+		count := 0
+		for _, field := range fields {
+			if field == asset {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Fatalf("release job references %s %d times, want exactly once", asset, count)
+		}
+	}
+	if !strings.Contains(releaseJob, "uses: actions/checkout@v4") || !strings.Contains(releaseJob, "release-assets/* LICENSE THIRD_PARTY_LICENSES.md") {
+		t.Fatalf("release job does not upload checked-out license assets exactly once:\n%s", releaseJob)
+	}
+}
+
 func TestPackageReleaseBuildsMinimalLinuxBundle(t *testing.T) {
 	root := projectRoot(t)
 	output := t.TempDir()
@@ -66,9 +95,11 @@ func TestPackageReleaseBuildsMinimalLinuxBundle(t *testing.T) {
 	wantEntries := []string{
 		"automation-gateway/INSTALL.txt",
 		"automation-gateway/LICENSE",
+		"automation-gateway/THIRD_PARTY_LICENSES.md",
 		"automation-gateway/" + binaryName,
 		"automation-gateway/configs/config.example.yaml",
 		"automation-gateway/configs/mib-metadata.example.json",
+		"automation-gateway/configs/modbus-sirax-bt72xx.example.yaml",
 		"automation-gateway/scripts/install.sh",
 		"automation-gateway/systemd/automation-gateway.service",
 	}
@@ -155,6 +186,15 @@ func TestPackageReleaseBuildsDebianPackage(t *testing.T) {
 	if !strings.Contains(metadata, "Package: automation-gateway") || !strings.Contains(metadata, "Architecture: arm64") || !strings.Contains(metadata, "Version: "+wantDebianVersion) {
 		t.Fatalf("unexpected Debian metadata:\n%s", metadata)
 	}
+	description, err := exec.Command("dpkg-deb", "-f", debPath, "Description").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, driver := range []string{"NUT", "SNMPv3", "Modbus RTU"} {
+		if !strings.Contains(string(description), driver) {
+			t.Fatalf("Debian description lacks %q: %s", driver, description)
+		}
+	}
 	ledFields, err := exec.Command("dpkg-deb", "-f", ledDebPath, "Package", "Architecture", "Version").CombinedOutput()
 	if err != nil {
 		t.Fatalf("LED dpkg-deb metadata failed: %v\n%s", err, ledFields)
@@ -171,11 +211,43 @@ func TestPackageReleaseBuildsDebianPackage(t *testing.T) {
 		"usr/sbin/automation-gateway",
 		"usr/share/automation-gateway/config.example.yaml",
 		"usr/share/automation-gateway/mib-metadata.example.json",
+		"usr/share/automation-gateway/modbus-sirax-bt72xx.example.yaml",
+		"usr/share/doc/automation-gateway/THIRD_PARTY_LICENSES.md",
 		"lib/systemd/system/automation-gateway.service",
 	} {
 		if _, err := os.Stat(filepath.Join(extracted, relative)); err != nil {
 			t.Fatalf("missing Debian payload %s: %v", relative, err)
 		}
+	}
+	wantDebPayload := []string{
+		"lib/systemd/system/automation-gateway.service",
+		"usr/sbin/automation-gateway",
+		"usr/share/automation-gateway/config.example.yaml",
+		"usr/share/automation-gateway/mib-metadata.example.json",
+		"usr/share/automation-gateway/modbus-sirax-bt72xx.example.yaml",
+		"usr/share/doc/automation-gateway/THIRD_PARTY_LICENSES.md",
+		"usr/share/doc/automation-gateway/copyright",
+	}
+	var gotDebPayload []string
+	if err := filepath.Walk(extracted, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			relative, err := filepath.Rel(extracted, path)
+			if err != nil {
+				return err
+			}
+			gotDebPayload = append(gotDebPayload, filepath.ToSlash(relative))
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(gotDebPayload)
+	sort.Strings(wantDebPayload)
+	if strings.Join(gotDebPayload, "\n") != strings.Join(wantDebPayload, "\n") {
+		t.Fatalf("Debian payload:\n%s\nwant:\n%s", strings.Join(gotDebPayload, "\n"), strings.Join(wantDebPayload, "\n"))
 	}
 	ledExtracted := t.TempDir()
 	if output, err := exec.Command("dpkg-deb", "-x", ledDebPath, ledExtracted).CombinedOutput(); err != nil {

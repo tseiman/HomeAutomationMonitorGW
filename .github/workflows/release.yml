@@ -34,8 +34,18 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Run tests
-        run: go test ./...
+      - name: Run tests and static analysis
+        run: |
+          go test ./...
+          go vet ./...
+
+      - name: Run race-enabled core tests
+        run: go test -race ./internal/... ./cmd/... ./zabbix/... ./systemd/...
+
+      - name: Verify CGO-free gateway cross-builds
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -trimpath -o "${RUNNER_TEMP}/automation-gateway-armv7" ./cmd/gateway
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o "${RUNNER_TEMP}/automation-gateway-arm64" ./cmd/gateway
 
   package:
     name: Package ${{ matrix.arch }}
@@ -93,6 +103,9 @@ jobs:
     needs: package
     runs-on: ubuntu-latest
     steps:
+      - name: Check out release license files
+        uses: actions/checkout@v4
+
       - name: Download all architecture artifacts
         uses: actions/download-artifact@v4
         with:
@@ -109,4 +122,4 @@ jobs:
           if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
             gh release create "$TAG_NAME" --verify-tag --generate-notes --title "$TAG_NAME"
           fi
-          gh release upload "$TAG_NAME" release-assets/* --clobber
+          gh release upload "$TAG_NAME" release-assets/* LICENSE THIRD_PARTY_LICENSES.md --clobber
