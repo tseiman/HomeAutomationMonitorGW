@@ -89,27 +89,35 @@ func TestDecodeRegistersAppliesScaleAndOffsetAndRejectsNonFinite(t *testing.T) {
 
 func TestDecodeRegistersSIRAXDCMeasuredVectors(t *testing.T) {
 	tests := []struct {
-		name      string
-		registers []uint16
-		scale     float64
-		want      float64
-		tolerance float64
+		name            string
+		registers       []uint16
+		raw             float64
+		scale           float64
+		want            float64
+		rawTolerance    float64
+		scaledTolerance float64
 	}{
-		{name: "voltage", registers: []uint16{0x51ec, 0x41bc}, scale: 1, want: 23.540, tolerance: 0.00001},
-		{name: "current", registers: []uint16{0x4c02, 0xc595}, scale: -0.0001, want: 0.4777501, tolerance: 0.0000001},
-		{name: "active power", registers: []uint16{0x3021, 0xc2e1}, scale: -0.1, want: 11.2594, tolerance: 0.00001},
-		{name: "apparent power", registers: []uint16{0xed91, 0xc2e0}, scale: -0.1, want: 11.2464, tolerance: 0.00001},
-		{name: "total energy uses positive scale", registers: []uint16{0x4a12, 0x3cdf}, scale: 0.1, want: 0.0027257, tolerance: 0.0000001},
+		{name: "voltage", registers: []uint16{0x4dd3, 0x41bc}, raw: 23.538, scale: 1, want: 23.538, rawTolerance: 0.000001, scaledTolerance: 0.000001},
+		{name: "current", registers: []uint16{0x7750, 0xc5a1}, raw: -5166.914, scale: -0.0001, want: 0.5166914, rawTolerance: 0.001, scaledTolerance: 0.0000001},
+		{name: "active power", registers: []uint16{0x849c, 0xc2f3}, raw: -121.759, scale: -0.1, want: 12.1759, rawTolerance: 0.00001, scaledTolerance: 0.000001},
+		{name: "reactive power", registers: []uint16{0x0000, 0x0000}, raw: 0, scale: -0.1, want: 0, rawTolerance: 0, scaledTolerance: 0},
+		{name: "apparent power", registers: []uint16{0x3c6a, 0xc2f3}, raw: -121.618, scale: -0.1, want: 12.1618, rawTolerance: 0.00001, scaledTolerance: 0.000001},
+		{name: "total energy", registers: []uint16{0x37bd, 0xbe06}, raw: -0.131072, scale: -0.1, want: 0.0131072, rawTolerance: 0.0000001, scaledTolerance: 0.0000001},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			definition := register(tc.name, 0, 3, "float32")
 			definition.WordOrder = "low_high"
 			definition.ByteOrder = "big"
+			definition.Scale = 1
+			raw, err := DecodeRegisters(definition, tc.registers)
+			if err != nil || math.Abs(raw-tc.raw) > tc.rawTolerance {
+				t.Fatalf("raw DecodeRegisters()=(%.10g, %v), want %.10g ± %.1g", raw, err, tc.raw, tc.rawTolerance)
+			}
 			definition.Scale = tc.scale
 			got, err := DecodeRegisters(definition, tc.registers)
-			if err != nil || math.Abs(got-tc.want) > tc.tolerance {
-				t.Fatalf("DecodeRegisters()=(%.10g, %v), want %.10g ± %.1g", got, err, tc.want, tc.tolerance)
+			if err != nil || math.Abs(got-tc.want) > tc.scaledTolerance {
+				t.Fatalf("scaled DecodeRegisters()=(%.10g, %v), want %.10g ± %.1g", got, err, tc.want, tc.scaledTolerance)
 			}
 		})
 	}

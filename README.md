@@ -161,7 +161,7 @@ CGO_ENABLED=0 go build -trimpath -o automation-gateway ./cmd/gateway
 
 Cross-building means compiling on one computer (for example, macOS) for a different target. Run all build and packaging commands from the repository root—the directory containing `go.mod`. The gateway's main package is `./cmd/gateway`; omitting it makes `go build` search the repository root for Go files and fail with `no Go files`.
 
-### 1. Determine the target architecture
+### 1. Confirm the target architecture
 
 Run this on the Debian or Raspberry Pi OS target:
 
@@ -169,6 +169,8 @@ Run this on the Debian or Raspberry Pi OS target:
 dpkg --print-architecture
 uname -m
 ```
+
+The confirmed SIRAX rollout target reports `aarch64`; use the `arm64` package target shown below. The mapping list remains useful for other installations.
 
 Pass the corresponding architecture to the packaging script:
 
@@ -485,15 +487,15 @@ For multi-register values, `word_order` is `high_low` or `low_high`, and `byte_o
 
 `bundle_reads: true` combines only touching, non-overlapping values with the same function code. Each source is limited to 512 configured register/bit definitions so validation and polling plans remain bounded on embedded gateways. `max_block_size` can reduce a bundle; zero uses the protocol maximum (2000 bits for FC01/02, 125 registers for FC03/04). One metric may never exceed the configured maximum. Gaps, different function codes, and the block limit create separate transactions.
 
-`response_timeout` applies to each bus attempt and `retries` is the number of additional attempts (`retries: 2` means at most three attempts). The source-level `timeout` bounds the complete collector poll. A poll is atomic: every planned block must read and decode successfully before a new snapshot is published. On failure, no partial values replace the cache; the last-known-good snapshot remains visible and becomes unavailable/stale according to collector health and `stale_after`.
+`response_timeout` applies to each bus attempt and `retries` is the number of additional attempts (`retries: 1` means at most two attempts). Omitted serial fields default to `9600` baud, `8N1`, a `2s` response timeout, one retry, and slave ID `1`; every setting remains configurable, and explicit `retries: 0` disables additional attempts. The source-level `timeout` bounds the complete collector poll. A poll is atomic: every planned block must read and decode successfully before a new snapshot is published. On failure, no partial values replace the cache; the last-known-good snapshot remains visible and becomes unavailable/stale according to collector health and `stale_after`.
 
-Multiple `modbus_rtu` sources may address different slaves on one physical serial bus. The gateway canonicalizes device paths, serializes transactions on the shared bus, and rejects conflicting baud/data/parity/stop settings for aliases of the same device. Each source keeps its own slave ID, response timeout, retries, poll health, and snapshot. Prefer `/dev/serial/by-id/...` over unstable `/dev/ttyUSB0` names.
+Multiple `modbus_rtu` sources may address different slaves on one physical serial bus. The gateway canonicalizes device paths, serializes transactions on the shared bus, and rejects conflicting baud/data/parity/stop settings for aliases of the same device. Device path, baud rate, data bits, `N`/`E`/`O` parity, stop bits, response timeout, retries, and slave ID remain configurable per source. Each source keeps its own slave ID, response timeout, retries, poll health, and snapshot. Prefer `/dev/serial/by-id/...` over unstable `/dev/ttyUSB*` names, including the `/dev/ttyUSB1` path used by the successful SIRAX test.
 
-The service remains unprivileged. The shipped unit leaves explicit host devices visible, but Unix device permissions still decide access. Add `automation-gateway` to the **actual group of the configured tty** (commonly `dialout`) or assign a dedicated udev group; the package does not guess or add either automatically:
+The service remains unprivileged. The shipped unit leaves explicit host devices visible, but Unix device permissions still decide access. The confirmed SIRAX tty group is `dialout`; add `automation-gateway` to that group (or assign a reviewed dedicated udev group) because the package does not change membership automatically:
 
 ```bash
 stat -Lc '%U %G %a %n' /dev/serial/by-id/<adapter>
-sudo usermod -a -G <actual-tty-group> automation-gateway
+sudo usermod -a -G dialout automation-gateway
 # Group membership is captured at process start:
 sudo systemctl restart automation-gateway
 ```
@@ -504,9 +506,11 @@ A successful `SIGHUP`/`systemctl reload` builds and validates a replacement coll
 
 #### SIRAX BT7250 DC example
 
-The separate SIRAX example records the confirmed installation facts: configuration register `40008` read back as `0x0003` (DC mode), internal current and voltage transformer factors are both `1.0`, FC03 works, and float32 values use `low_high` words with `big` bytes. Ten conductor passes run opposite to the measurement direction. Therefore current uses `-0.0001 A` and active/reactive/apparent power use `-0.1 W/var/VA`; voltage, power factor, frequency, and THD use scale `1`. Total, positive, and negative energy use **positive** `+0.1 kWh`: pass-count compensation applies, but energy is deliberately not sign-inverted. Do not configure the same transformer/pass correction in both the meter and gateway.
+The separate SIRAX example records the confirmed installation facts: configuration register `40008` read back as `0x0003` (DC mode), internal current and voltage transformer factors are both `1.0`, FC03 works, float32 values use `low_high` words with `big` bytes, and serial communication works at `9600 8N1`, slave `1`, with a `2s` response timeout and one retry. Ten conductor passes run opposite to the measurement direction. Therefore current uses `-0.0001 A`, while active/reactive/apparent power and the now-observed-negative total-energy counter use `-0.1` in their respective units. The negative total-energy scale both inverts direction and divides by ten. Voltage, power factor, frequency, and THD use scale `1`.
 
-The example's `9600 8N1`, slave `1` remains provisional. Before production, an operator must verify the real serial framing and slave ID, total-energy sign/count direction, positive/negative counter behavior, stable tty identity and permissions, RS485 termination/bias/direction, and readings against an independent reference. Validate configuration offline first, then roll out one read-only source with conservative polling and inspect cached values/health. The gateway performs no SIRAX writes or configuration; changing device mode or transformer factors is outside its scope.
+`scale` is the single per-register factor; do not introduce or apply a second energy-direction correction. `energy_positive` and `energy_negative` remain independently configurable because their directions were not measured: set either sign from its observed raw counter and include the ten-pass division exactly once. During commissioning, inspect the configured words, decoded raw values, scales, offsets, published `raw*scale+offset` results, and source health. The gateway deterministically publishes that configured result; verification does not require a separate instrument.
+
+The successful test used `/dev/ttyUSB1`, but production should select the adapter's stable `/dev/serial/by-id/...` path. USB/RS485 adapters normally handle transmit direction, as the test scripts did with an ordinary serial port. Native-UART direction/RTS/GPIO setup remains external to the gateway. The gateway performs no SIRAX writes or configuration; changing device mode or transformer factors is outside its scope.
 
 ## MIB metadata with `mib2json`
 

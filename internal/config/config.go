@@ -107,6 +107,8 @@ type ModbusRTUSource struct {
 	MaxBlockSize    uint16           `yaml:"max_block_size"`
 	Registers       []ModbusRegister `yaml:"registers"`
 	bundleReadsSet  bool
+	retriesSet      bool
+	slaveIDSet      bool
 }
 
 // ModbusRegister maps one zero-based PDU address to a typed metric.
@@ -124,7 +126,7 @@ type ModbusRegister struct {
 	scaleSet    bool
 }
 
-// UnmarshalYAML records whether read bundling was explicitly disabled.
+// UnmarshalYAML records zero-valued options that differ from omitted defaults.
 func (m *ModbusRTUSource) UnmarshalYAML(node *yaml.Node) error {
 	type plain ModbusRTUSource
 	var decoded plain
@@ -133,8 +135,13 @@ func (m *ModbusRTUSource) UnmarshalYAML(node *yaml.Node) error {
 	}
 	*m = ModbusRTUSource(decoded)
 	for i := 0; i+1 < len(node.Content); i += 2 {
-		if node.Content[i].Value == "bundle_reads" {
+		switch node.Content[i].Value {
+		case "bundle_reads":
 			m.bundleReadsSet = true
+		case "retries":
+			m.retriesSet = true
+		case "slave_id":
+			m.slaveIDSet = true
 		}
 	}
 	return nil
@@ -564,7 +571,13 @@ func (c *Config) defaults() {
 				modbus.StopBits = 1
 			}
 			if !modbus.ResponseTimeout.set && modbus.ResponseTimeout.Duration == 0 {
-				modbus.ResponseTimeout.Duration = time.Second
+				modbus.ResponseTimeout.Duration = 2 * time.Second
+			}
+			if !modbus.retriesSet {
+				modbus.Retries = 1
+			}
+			if !modbus.slaveIDSet {
+				modbus.SlaveID = 1
 			}
 			if !modbus.bundleReadsSet {
 				modbus.BundleReads = true

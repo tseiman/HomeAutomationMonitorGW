@@ -326,11 +326,11 @@ func TestSIRAXBT72xxExampleParsesWithConfirmedDCScaling(t *testing.T) {
 		{"power_factor", 82, "float32", 1, ""},
 		{"frequency", 84, "float32", 1, "Hz"},
 		{"thd", 86, "float32", 1, ""},
-		{"energy_total", 88, "float32", 0.1, "kWh"},
+		{"energy_total", 88, "float32", -0.1, "kWh"},
 		{"energy_positive", 90, "float32", 0.1, "kWh"},
 		{"energy_negative", 92, "float32", 0.1, "kWh"},
 	}
-	if len(modbus.Registers) != len(want) || modbus.SlaveID != 1 || modbus.BaudRate != 9600 || modbus.DataBits != 8 || modbus.Parity != "N" || modbus.StopBits != 1 {
+	if len(modbus.Registers) != len(want) || modbus.SlaveID != 1 || modbus.BaudRate != 9600 || modbus.DataBits != 8 || modbus.Parity != "N" || modbus.StopBits != 1 || modbus.ResponseTimeout.Duration != 2*time.Second || modbus.Retries != 1 {
 		t.Fatalf("SIRAX Modbus settings=%+v", modbus)
 	}
 	for index, expected := range want {
@@ -503,8 +503,8 @@ func TestLoadModbusRTUSchemaDefaultsAndExplicitValues(t *testing.T) {
 
 	body := modbusYAML(token)
 	for _, line := range []string{
-		"      data_bits: 8\n", "      parity: N\n", "      stop_bits: 1\n", "      response_timeout: 750ms\n",
-		"      retries: 2\n", "      bundle_reads: false\n", "      max_block_size: 16\n",
+		"      baud_rate: 9600\n", "      data_bits: 8\n", "      parity: N\n", "      stop_bits: 1\n", "      response_timeout: 750ms\n",
+		"      retries: 2\n", "      slave_id: 1\n", "      bundle_reads: false\n", "      max_block_size: 16\n",
 	} {
 		body = strings.Replace(body, line, "", 1)
 	}
@@ -513,8 +513,21 @@ func TestLoadModbusRTUSchemaDefaultsAndExplicitValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	modbus = got.Sources[0].ModbusRTU
-	if modbus.BaudRate != 9600 || modbus.DataBits != 8 || modbus.Parity != "N" || modbus.StopBits != 1 || modbus.ResponseTimeout.Duration != time.Second || modbus.Retries != 0 || !modbus.BundleReads || modbus.MaxBlockSize != 0 {
+	if modbus.BaudRate != 9600 || modbus.DataBits != 8 || modbus.Parity != "N" || modbus.StopBits != 1 || modbus.ResponseTimeout.Duration != 2*time.Second || modbus.Retries != 1 || modbus.SlaveID != 1 || !modbus.BundleReads || modbus.MaxBlockSize != 0 {
 		t.Fatalf("modbus defaults=%+v", modbus)
+	}
+}
+
+func TestLoadModbusRTUPreservesExplicitZeroRetries(t *testing.T) {
+	directory := t.TempDir()
+	token := writeSecret(t, directory, "token", "test-token-value")
+	body := strings.Replace(modbusYAML(token), "      retries: 2", "      retries: 0", 1)
+	got, err := Load(writeConfigFile(t, directory, body), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retries := got.Sources[0].ModbusRTU.Retries; retries != 0 {
+		t.Fatalf("explicit retries=%d, want 0", retries)
 	}
 }
 
