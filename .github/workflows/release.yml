@@ -42,12 +42,12 @@ jobs:
           test_status=${PIPESTATUS[0]}
           set -e
           if [[ "$test_status" -ne 0 ]]; then
-            while IFS= read -r line; do
-              line="${line//'%'/'%25'}"
-              line="${line//$'\r'/'%0D'}"
-              line="${line//$'\n'/'%0A'}"
-              printf '::error file=.github/workflows/release.yml,line=39::%s\n' "$line"
-            done < test-output.log
+            python3 - <<'PY'
+          from pathlib import Path
+          lines = Path("test-output.log").read_text(errors="replace").splitlines()[-30:]
+          message = "\n".join(lines).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::error file=.github/workflows/release.yml,line=39::{message}")
+          PY
             exit "$test_status"
           fi
 
