@@ -42,7 +42,7 @@ func TestCustomMapSchemaValidation(t *testing.T) {
 	php := phpSkip(t)
 
 	// PHP inline logic that mirrors the key/filename/entry validation in widget.view.php.
-	phpLogic := `<?php
+	phpLogic := `
 // Controller key: starts with digit, alphanumeric/slash/hyphen.
 $validCtrlKey = static fn(string $k): bool =>
     (bool) preg_match('/^[0-9][0-9a-zA-Z\/\-]*$/', $k);
@@ -153,7 +153,7 @@ echo $ok ? "OK\n" : "FAILURES\n";`
 func TestCustomMapJSONParsing(t *testing.T) {
 	php := phpSkip(t)
 
-	phpLogic := `<?php
+	phpLogic := `
 // Mirrors $loadConfigMap from widget.view.php (without file I/O or img_path resolution).
 function loadFromJSON(?string $raw): array {
     $ctrl = []; $mod = [];
@@ -256,7 +256,7 @@ func TestCustomSvgPathSafety(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	phpLogic := `<?php
+	phpLogic := `
 $imagesDir = $argv[1];
 $imagesReal = realpath($imagesDir);
 
@@ -295,7 +295,7 @@ echo $ok ? "OK\n" : "FAILURES\n";`
 func TestFallbackHintContent(t *testing.T) {
 	php := phpSkip(t)
 
-	phpLogic := `<?php
+	phpLogic := `
 $e = static fn($v) => htmlspecialchars((string) $v, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 // v2.0: hint references the catalog (not a specific slot).
 $moduleCatalogHint = static function(string $liveSnmpId) use ($e): string {

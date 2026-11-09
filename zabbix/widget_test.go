@@ -683,7 +683,7 @@ func TestCatalogModuleIdentification(t *testing.T) {
 		t.Skip("php not installed — skipping catalog identification test")
 	}
 
-	phpLogic := `<?php
+	phpLogic := `
 // New v2.0 article catalog — mirrors default_svg_map.json.
 $catalog = [
     '750-400'  => ['SNMP_ID'=>'750-4xx',         'type'=>1,   'process_image'=>['analog_in'=>0,'analog_out'=>0,'digital_in'=>2, 'digital_out'=>0]],
@@ -769,7 +769,7 @@ func TestCatalogAmbiguousUnknownStates(t *testing.T) {
 		t.Skip("php not installed")
 	}
 
-	phpLogic := `<?php
+	phpLogic := `
 $catalog = [
     '750-400'  => ['SNMP_ID'=>'750-4xx','type'=>1,'process_image'=>['analog_in'=>0,'analog_out'=>0,'digital_in'=>2,'digital_out'=>0]],
     '750-1405' => ['SNMP_ID'=>'750-4xx','type'=>1,'process_image'=>['analog_in'=>0,'analog_out'=>0,'digital_in'=>16,'digital_out'=>0]],
@@ -920,7 +920,7 @@ func TestCatalogExtensionNoSlotConfig(t *testing.T) {
 		t.Skip("php not installed")
 	}
 
-	phpLogic := `<?php
+	phpLogic := `
 // Start with baseline catalog.
 $catalog = [
     '750-400' => ['SNMP_ID'=>'750-4xx','type'=>1,'process_image'=>['analog_in'=>0,'analog_out'=>0,'digital_in'=>2,'digital_out'=>0]],
@@ -986,7 +986,7 @@ func TestJsonControllerResolution(t *testing.T) {
 	if err != nil {
 		t.Skip("php not installed")
 	}
-	phpLogic := `<?php
+	phpLogic := `
 // Mirror of the widget resolveController logic.
 function resolveController(?string $liveArticle, array $configControllers): ?array {
     if ($liveArticle === null) return null;
