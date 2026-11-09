@@ -14,13 +14,17 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/tseiman/HomeAutomationMonitorGW/internal/cache"
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/config"
+	"github.com/tseiman/HomeAutomationMonitorGW/internal/drivers/modbusrtu"
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/metrics"
 )
 
@@ -174,6 +178,464 @@ func TestCheckFilesUsesEveryOrderedLayer(t *testing.T) {
 	}
 }
 
+type recordingModbusBus struct {
+	readers int
+	closed  int
+	reader  modbusrtu.ReadTransport
+}
+
+func (b *recordingModbusBus) Reader(config.ModbusRTUSource) (modbusrtu.ReadTransport, error) {
+	b.readers++
+	return b.reader, nil
+}
+
+func (b *recordingModbusBus) Close() error {
+	b.closed++
+	return nil
+}
+
+type blockingModbusReader struct{}
+
+func (*blockingModbusReader) ReadCoils(ctx context.Context, _ uint8, _, _ uint16) ([]byte, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (r *blockingModbusReader) ReadDiscreteInputs(ctx context.Context, slave uint8, address, quantity uint16) ([]byte, error) {
+	return r.ReadCoils(ctx, slave, address, quantity)
+}
+func (r *blockingModbusReader) ReadHoldingRegisters(ctx context.Context, slave uint8, address, quantity uint16) ([]byte, error) {
+	return r.ReadCoils(ctx, slave, address, quantity)
+}
+func (r *blockingModbusReader) ReadInputRegisters(ctx context.Context, slave uint8, address, quantity uint16) ([]byte, error) {
+	return r.ReadCoils(ctx, slave, address, quantity)
+}
+
+func testModbusSource(slave uint8, metricName string) *config.ModbusRTUSource {
+	return &config.ModbusRTUSource{
+		Device: "/dev/does-not-exist", BaudRate: 9600, DataBits: 8, Parity: "N", StopBits: 1,
+		ResponseTimeout: config.Duration{Duration: 10 * time.Millisecond}, SlaveID: slave, BundleReads: true,
+		Registers: []config.ModbusRegister{{Name: metricName, Address: 1, Function: 4, Type: "uint16", WordOrder: "high_low", ByteOrder: "big", Scale: 1}},
+	}
+}
+
+// TestPrepareSourcesSupportsModbusWithoutOpeningHardware verifies candidate preparation creates every Modbus collector from one generation bus and publishes static discovery metadata.
+func TestPrepareSourcesSupportsModbusWithoutOpeningHardware(t *testing.T) {
+	bus := &recordingModbusBus{reader: &blockingModbusReader{}}
+	cfg := config.Config{Sources: []config.Source{
+		{Name: "meter-a", Driver: "modbus_rtu", Enabled: true, PollInterval: config.Duration{Duration: time.Hour}, StaleAfter: config.Duration{Duration: time.Minute}, Timeout: config.Duration{Duration: 50 * time.Millisecond}, ModbusRTU: testModbusSource(1, "voltage")},
+		{Name: "meter-b", Driver: "modbus_rtu", Enabled: true, PollInterval: config.Duration{Duration: time.Hour}, StaleAfter: config.Duration{Duration: time.Minute}, Timeout: config.Duration{Duration: 50 * time.Millisecond}, ModbusRTU: testModbusSource(2, "current")},
+	}}
+	prepared, err := prepareSourcesWithDependencies(cfg, dependencies{newModbusBus: func() modbusBus { return bus }})
+	if err != nil {
+		t.Fatalf("prepareSources: %v", err)
+	}
+	defer prepared.close()
+	if bus.readers != 2 || len(prepared.specs) != 2 {
+		t.Fatalf("readers=%d specs=%d", bus.readers, len(prepared.specs))
+	}
+	for index, name := range []string{"voltage", "current"} {
+		spec := prepared.specs[index]
+		if spec.driver != "modbus_rtu" || spec.timeout != 50*time.Millisecond || len(spec.staticDiscovery) != 1 || spec.staticDiscovery[0].Name != name {
+			t.Fatalf("spec[%d]=%+v", index, spec)
+		}
+	}
+}
+
+func writeModbusConfig(t *testing.T, path, cert, key, token, metric string, address uint16) {
+	body := fmt.Sprintf("server:\n  listen: '127.0.0.1:8443'\n  certificate: %q\n  private_key: %q\nauthentication:\n  bearer_token_files: [%q]\n  allowed_clients: ['127.0.0.1']\nsources:\n  - name: meter\n    driver: modbus_rtu\n    poll_interval: 10ms\n    stale_after: 30ms\n    timeout: 20ms\n    modbus_rtu:\n      device: /dev/absent-test-device\n      response_timeout: 5ms\n      retries: 1\n      slave_id: 1\n      registers:\n        - name: %s\n          address: %d\n          function: 4\n          type: uint16\n", cert, key, token, metric, address)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRuntimePublishesModbusDiscoveryBeforeAbsentDevicePollCompletes verifies registration and static discovery need no bus traffic.
+func TestRuntimePublishesModbusDiscoveryBeforeAbsentDevicePollCompletes(t *testing.T) {
+	directory := t.TempDir()
+	certificate, key := pair(t, directory, "modbus", 5)
+	token := filepath.Join(directory, "token")
+	if err := os.WriteFile(token, []byte("modbus-test-token-value"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configuration := filepath.Join(directory, "config.yaml")
+	writeModbusConfig(t, configuration, certificate, key, token, "voltage", 72)
+	bus := &recordingModbusBus{reader: &blockingModbusReader{}}
+	runtime, err := newFilesWithDependencies([]string{configuration}, nil, dependencies{newModbusBus: func() modbusBus { return bus }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	snapshot, ok := runtime.View().Store.Snapshot("meter")
+	if !ok || snapshot.Driver != "modbus_rtu" || len(snapshot.Discovery) != 1 || snapshot.Discovery[0].Name != "voltage" {
+		t.Fatalf("snapshot=%+v ok=%v", snapshot, ok)
+	}
+	if len(snapshot.Metrics) != 0 {
+		t.Fatalf("poll populated metrics while device is absent: %+v", snapshot.Metrics)
+	}
+}
+
+type lifecycleReader struct {
+	started   chan struct{}
+	exited    chan struct{}
+	onRead    func() error
+	startOnce sync.Once
+	exitOnce  sync.Once
+}
+
+func (r *lifecycleReader) read(ctx context.Context) ([]byte, error) {
+	r.startOnce.Do(func() { close(r.started) })
+	if r.onRead != nil {
+		if err := r.onRead(); err != nil {
+			return nil, err
+		}
+	}
+	<-ctx.Done()
+	r.exitOnce.Do(func() { close(r.exited) })
+	return nil, ctx.Err()
+}
+func (r *lifecycleReader) ReadCoils(ctx context.Context, _ uint8, _, _ uint16) ([]byte, error) {
+	return r.read(ctx)
+}
+func (r *lifecycleReader) ReadDiscreteInputs(ctx context.Context, _ uint8, _, _ uint16) ([]byte, error) {
+	return r.read(ctx)
+}
+func (r *lifecycleReader) ReadHoldingRegisters(ctx context.Context, _ uint8, _, _ uint16) ([]byte, error) {
+	return r.read(ctx)
+}
+func (r *lifecycleReader) ReadInputRegisters(ctx context.Context, _ uint8, _, _ uint16) ([]byte, error) {
+	return r.read(ctx)
+}
+
+type lifecycleBus struct {
+	reader modbusrtu.ReadTransport
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (b *lifecycleBus) Reader(config.ModbusRTUSource) (modbusrtu.ReadTransport, error) {
+	return b.reader, nil
+}
+func (b *lifecycleBus) Close() error { b.once.Do(func() { close(b.closed) }); return nil }
+
+// TestReloadWaitsForOldTransactionsAndClosesBusBeforeNewPolling verifies generations never overlap on a serial port.
+func TestReloadWaitsForOldTransactionsAndClosesBusBeforeNewPolling(t *testing.T) {
+	directory := t.TempDir()
+	certificate, key := pair(t, directory, "reload-bus", 6)
+	token := filepath.Join(directory, "token")
+	if err := os.WriteFile(token, []byte("reload-bus-token-value"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configuration := filepath.Join(directory, "config.yaml")
+	writeModbusConfig(t, configuration, certificate, key, token, "voltage", 72)
+
+	firstReader := &lifecycleReader{started: make(chan struct{}), exited: make(chan struct{})}
+	firstBus := &lifecycleBus{reader: firstReader, closed: make(chan struct{})}
+	violation := make(chan error, 1)
+	secondReader := &lifecycleReader{started: make(chan struct{}), exited: make(chan struct{}), onRead: func() error {
+		select {
+		case <-firstBus.closed:
+			return nil
+		default:
+			err := errors.New("new generation polled before old bus closed")
+			violation <- err
+			return err
+		}
+	}}
+	secondBus := &lifecycleBus{reader: secondReader, closed: make(chan struct{})}
+	buses := []modbusBus{firstBus, secondBus}
+	var factoryMu sync.Mutex
+	deps := dependencies{newModbusBus: func() modbusBus {
+		factoryMu.Lock()
+		defer factoryMu.Unlock()
+		bus := buses[0]
+		buses = buses[1:]
+		return bus
+	}}
+	runtime, err := newFilesWithDependencies([]string{configuration}, nil, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	select {
+	case <-firstReader.started:
+	case <-time.After(time.Second):
+		t.Fatal("old poll did not start")
+	}
+	if err := runtime.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-firstReader.exited:
+	default:
+		t.Fatal("reload returned before old transaction exited")
+	}
+	select {
+	case <-firstBus.closed:
+	default:
+		t.Fatal("reload did not close old bus")
+	}
+	select {
+	case <-secondReader.started:
+	case <-time.After(time.Second):
+		t.Fatal("new poll did not start")
+	}
+	select {
+	case err := <-violation:
+		t.Fatal(err)
+	default:
+	}
+}
+
+// TestModbusPollingAppearsInStatusActivity verifies Modbus workers use the common observer path consumed by status and SSE.
+func TestModbusPollingAppearsInStatusActivity(t *testing.T) {
+	directory := t.TempDir()
+	certificate, key := pair(t, directory, "activity", 10)
+	token := filepath.Join(directory, "token")
+	if err := os.WriteFile(token, []byte("activity-token-value"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configuration := filepath.Join(directory, "config.yaml")
+	writeModbusConfig(t, configuration, certificate, key, token, "voltage", 72)
+	reader := &lifecycleReader{started: make(chan struct{}), exited: make(chan struct{})}
+	bus := &lifecycleBus{reader: reader, closed: make(chan struct{})}
+	runtime, err := newFilesWithDependencies([]string{configuration}, nil, dependencies{newModbusBus: func() modbusBus { return bus }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	select {
+	case <-reader.started:
+	case <-time.After(time.Second):
+		t.Fatal("poll did not start")
+	}
+	status := runtime.View().Status.Snapshot()
+	if !status.Activity.Active || len(status.Activity.Collectors) != 1 || status.Activity.Collectors[0] != "meter" || !status.Collectors["meter"].Polling {
+		t.Fatalf("status activity=%+v", status)
+	}
+}
+
+// TestCloseCancelsWorkersAndClosesModbusResources verifies shutdown releases the active generation bus.
+func TestCloseCancelsWorkersAndClosesModbusResources(t *testing.T) {
+	directory := t.TempDir()
+	certificate, key := pair(t, directory, "close-bus", 7)
+	token := filepath.Join(directory, "token")
+	if err := os.WriteFile(token, []byte("close-bus-token-value"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configuration := filepath.Join(directory, "config.yaml")
+	writeModbusConfig(t, configuration, certificate, key, token, "voltage", 72)
+	reader := &lifecycleReader{started: make(chan struct{}), exited: make(chan struct{})}
+	bus := &lifecycleBus{reader: reader, closed: make(chan struct{})}
+	runtime, err := newFilesWithDependencies([]string{configuration}, nil, dependencies{newModbusBus: func() modbusBus { return bus }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-reader.started:
+	case <-time.After(time.Second):
+		t.Fatal("poll did not start")
+	}
+	runtime.Close()
+	select {
+	case <-reader.exited:
+	default:
+		t.Fatal("close returned before worker exited")
+	}
+	select {
+	case <-bus.closed:
+	default:
+		t.Fatal("close did not release bus")
+	}
+}
+
+type sequenceModbusReader struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (r *sequenceModbusReader) read(context.Context) ([]byte, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	if r.calls == 1 {
+		return []byte{0, 42}, nil
+	}
+	return nil, errors.New("device absent")
+}
+func (r *sequenceModbusReader) ReadCoils(ctx context.Context, _ uint8, _, _ uint16) ([]byte, error) {
+	return r.read(ctx)
+}
+func (r *sequenceModbusReader) ReadDiscreteInputs(ctx context.Context, _ uint8, _, _ uint16) ([]byte, error) {
+	return r.read(ctx)
+}
+func (r *sequenceModbusReader) ReadHoldingRegisters(ctx context.Context, _ uint8, _, _ uint16) ([]byte, error) {
+	return r.read(ctx)
+}
+func (r *sequenceModbusReader) ReadInputRegisters(ctx context.Context, _ uint8, _, _ uint16) ([]byte, error) {
+	return r.read(ctx)
+}
+
+// TestModbusPollFailurePreservesSnapshotAndUpdatesHealth verifies the generic cache/status lifecycle around a failed Modbus poll.
+func TestModbusPollFailurePreservesSnapshotAndUpdatesHealth(t *testing.T) {
+	directory := t.TempDir()
+	certificate, key := pair(t, directory, "poll-health", 8)
+	token := filepath.Join(directory, "token")
+	if err := os.WriteFile(token, []byte("poll-health-token-value"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configuration := filepath.Join(directory, "config.yaml")
+	writeModbusConfig(t, configuration, certificate, key, token, "voltage", 72)
+	bus := &lifecycleBus{reader: &sequenceModbusReader{}, closed: make(chan struct{})}
+	runtime, err := newFilesWithDependencies([]string{configuration}, nil, dependencies{newModbusBus: func() modbusBus { return bus }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	deadline := time.After(time.Second)
+	var snapshot cache.Snapshot
+	for {
+		snapshot, _ = runtime.View().Store.Snapshot("meter")
+		if !snapshot.Available && !snapshot.LastSuccess.IsZero() {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("failure transition not observed: %+v", snapshot)
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if !snapshot.Stale || len(snapshot.Metrics) != 1 || snapshot.Metrics[0].Name != "voltage" || snapshot.Metrics[0].Value != float64(42) {
+		t.Fatalf("last-known-good snapshot not preserved: %+v", snapshot)
+	}
+	status := runtime.View().Status.Snapshot()
+	if status.Collectors["meter"].Health != "failed" || !status.Collectors["meter"].Stale {
+		t.Fatalf("status=%+v", status)
+	}
+}
+
+type failingBus struct{ closed bool }
+
+func (*failingBus) Reader(config.ModbusRTUSource) (modbusrtu.ReadTransport, error) {
+	return nil, errors.New("candidate reader failure")
+}
+func (b *failingBus) Close() error { b.closed = true; return nil }
+
+// TestFailedModbusReloadPreservesActiveGeneration verifies candidate assembly errors do not cancel or replace the current runtime.
+func TestFailedModbusReloadPreservesActiveGeneration(t *testing.T) {
+	directory := t.TempDir()
+	certificate, key := pair(t, directory, "failed-reload", 9)
+	token := filepath.Join(directory, "token")
+	if err := os.WriteFile(token, []byte("failed-reload-token-value"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configuration := filepath.Join(directory, "config.yaml")
+	writeModbusConfig(t, configuration, certificate, key, token, "voltage", 72)
+	reader := &lifecycleReader{started: make(chan struct{}), exited: make(chan struct{})}
+	activeBus := &lifecycleBus{reader: reader, closed: make(chan struct{})}
+	badBus := &failingBus{}
+	buses := []modbusBus{activeBus, badBus}
+	deps := dependencies{newModbusBus: func() modbusBus { bus := buses[0]; buses = buses[1:]; return bus }}
+	runtime, err := newFilesWithDependencies([]string{configuration}, nil, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	select {
+	case <-reader.started:
+	case <-time.After(time.Second):
+		t.Fatal("active poll did not start")
+	}
+	oldStore := runtime.View().Store
+	if err := runtime.Reload(); err == nil {
+		t.Fatal("failed candidate was accepted")
+	}
+	if runtime.View().Store != oldStore {
+		t.Fatal("failed reload replaced active store")
+	}
+	select {
+	case <-activeBus.closed:
+		t.Fatal("failed reload closed active bus")
+	default:
+	}
+	if !badBus.closed {
+		t.Fatal("failed candidate bus was not closed")
+	}
+}
+
+// TestModbusIdentityIncludesCompleteInterpretation verifies only byte-for-byte equivalent Modbus source semantics retain snapshots.
+func TestModbusIdentityIncludesCompleteInterpretation(t *testing.T) {
+	base := config.Source{Name: "meter", Driver: "modbus_rtu", Enabled: true, PollInterval: config.Duration{Duration: time.Second}, StaleAfter: config.Duration{Duration: 2 * time.Second}, Timeout: config.Duration{Duration: 500 * time.Millisecond}, ModbusRTU: testModbusSource(1, "voltage")}
+	original := sourceIdentity(base, nil)
+	unchanged := base
+	copyModbus := *base.ModbusRTU
+	copyModbus.Registers = append([]config.ModbusRegister(nil), base.ModbusRTU.Registers...)
+	unchanged.ModbusRTU = &copyModbus
+	if sourceIdentity(unchanged, nil) != original {
+		t.Fatal("unchanged Modbus identity changed")
+	}
+	mutations := []func(*config.Source){
+		func(s *config.Source) { s.ModbusRTU.Device = "/dev/other" },
+		func(s *config.Source) { s.ModbusRTU.ResponseTimeout.Duration++ },
+		func(s *config.Source) { s.ModbusRTU.Retries++ },
+		func(s *config.Source) { s.ModbusRTU.SlaveID++ },
+		func(s *config.Source) { s.ModbusRTU.BundleReads = !s.ModbusRTU.BundleReads },
+		func(s *config.Source) { s.ModbusRTU.MaxBlockSize++ },
+		func(s *config.Source) { s.ModbusRTU.Registers[0].Address++ },
+		func(s *config.Source) { s.ModbusRTU.Registers[0].WordOrder = "low_high" },
+		func(s *config.Source) { s.ModbusRTU.Registers[0].ByteOrder = "little" },
+		func(s *config.Source) { s.ModbusRTU.Registers[0].Scale = 0.1 },
+		func(s *config.Source) { s.ModbusRTU.Registers[0].Offset = 2 },
+		func(s *config.Source) { s.ModbusRTU.Registers[0].Unit = "mV" },
+		func(s *config.Source) { s.ModbusRTU.Registers[0].Description = "changed" },
+	}
+	for index, mutate := range mutations {
+		candidate := base
+		modbus := *base.ModbusRTU
+		modbus.Registers = append([]config.ModbusRegister(nil), base.ModbusRTU.Registers...)
+		candidate.ModbusRTU = &modbus
+		mutate(&candidate)
+		if sourceIdentity(candidate, nil) == original {
+			t.Fatalf("mutation %d did not change identity", index)
+		}
+	}
+}
+
+// TestModbusReloadCarriesOnlyUnchangedSnapshots verifies generation restoration uses the complete Modbus identity.
+func TestModbusReloadCarriesOnlyUnchangedSnapshots(t *testing.T) {
+	source := config.Source{Name: "meter", Driver: "modbus_rtu", Enabled: true, PollInterval: config.Duration{Duration: time.Second}, StaleAfter: config.Duration{Duration: 2 * time.Second}, Timeout: config.Duration{Duration: 500 * time.Millisecond}, ModbusRTU: testModbusSource(1, "voltage")}
+	prepare := func(source config.Source) preparedSources {
+		bus := &recordingModbusBus{reader: &blockingModbusReader{}}
+		prepared, err := prepareSourcesWithDependencies(config.Config{Sources: []config.Source{source}}, dependencies{newModbusBus: func() modbusBus { return bus }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = prepared.close() })
+		return prepared
+	}
+	original := prepare(source)
+	first := buildGeneration(config.Config{}, nil, original.specs, nil)
+	first.store.Success("meter", []metrics.Metric{{Name: "voltage", Value: float64(24)}}, time.Millisecond)
+	unchanged := prepare(source)
+	retained := buildGeneration(config.Config{}, nil, unchanged.specs, first)
+	retainedSnapshot, _ := retained.store.Snapshot("meter")
+	if len(retainedSnapshot.Metrics) != 1 {
+		t.Fatalf("unchanged snapshot lost: %+v", retainedSnapshot)
+	}
+	changedSource := source
+	changedModbus := *source.ModbusRTU
+	changedModbus.Registers = append([]config.ModbusRegister(nil), source.ModbusRTU.Registers...)
+	changedModbus.Registers[0].Scale = 0.1
+	changedSource.ModbusRTU = &changedModbus
+	changed := prepare(changedSource)
+	cleared := buildGeneration(config.Config{}, nil, changed.specs, first)
+	clearedSnapshot, _ := cleared.store.Snapshot("meter")
+	if len(clearedSnapshot.Metrics) != 0 {
+		t.Fatalf("changed interpretation retained snapshot: %+v", clearedSnapshot)
+	}
+	if len(clearedSnapshot.Discovery) != 1 {
+		t.Fatalf("changed generation lost static discovery: %+v", clearedSnapshot)
+	}
+}
+
 // TestPrepareSourcesSupportsSNMPOnly verifies one SNMP source is prepared without NUT or network access.
 func TestPrepareSourcesSupportsSNMPOnly(t *testing.T) {
 	cfg := config.Config{
@@ -222,6 +684,19 @@ func TestBuildGenerationPublishesCompletePolicyAndCompatibleCache(t *testing.T) 
 	changedSnapshot, _ := changed.store.Snapshot("retained")
 	if len(changedSnapshot.Metrics) != 0 {
 		t.Fatalf("snapshot crossed incompatible source identity: %+v", changedSnapshot)
+	}
+}
+
+type errorResource struct{ err error }
+
+func (r errorResource) Close() error { return r.err }
+
+// TestCloseContextReportsResourceCloseFailure verifies callers can observe a failed bus close.
+func TestCloseContextReportsResourceCloseFailure(t *testing.T) {
+	expected := errors.New("close failed")
+	runtime := &Runtime{resources: []interface{ Close() error }{errorResource{err: expected}}}
+	if err := runtime.CloseContext(context.Background()); !errors.Is(err, expected) {
+		t.Fatalf("CloseContext error=%v", err)
 	}
 }
 

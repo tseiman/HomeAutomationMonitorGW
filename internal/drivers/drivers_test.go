@@ -62,6 +62,51 @@ func TestRunnerPollsImmediatelyAndContainsFailure(t *testing.T) {
 	}
 }
 
+type blockingCollector struct {
+	deadline time.Time
+}
+
+func (c *blockingCollector) Poll(ctx context.Context) ([]metrics.Metric, error) {
+	c.deadline, _ = ctx.Deadline()
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// TestRunnerAppliesOneTimeoutToTheEntirePoll verifies the common source timeout bounds a complete collector operation.
+func TestRunnerAppliesOneTimeoutToTheEntirePoll(t *testing.T) {
+	store := cache.New(time.Now)
+	store.Register("source", "fake", time.Minute)
+	collector := &blockingCollector{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	started := time.Now()
+	go func() {
+		RunWithTimeout(ctx, "source", time.Hour, 20*time.Millisecond, collector, store, nil, nil)
+		close(done)
+	}()
+	deadline := time.After(250 * time.Millisecond)
+	for {
+		snapshot, _ := store.Snapshot("source")
+		if !snapshot.LastAttempt.IsZero() {
+			if snapshot.Available || !snapshot.Stale || time.Since(started) > 200*time.Millisecond {
+				t.Fatalf("snapshot=%+v elapsed=%v", snapshot, time.Since(started))
+			}
+			if collector.deadline.IsZero() {
+				t.Fatal("collector context had no deadline")
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed poll did not finish")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+}
+
 // TestRunnerReportsActivityAroundPoll verifies activity begins before collection and ends after cache publication.
 func TestRunnerReportsActivityAroundPoll(t *testing.T) {
 	store := cache.New(time.Now)

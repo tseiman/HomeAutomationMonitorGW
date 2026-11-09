@@ -150,6 +150,33 @@ func TestSourceMetricsJSONAndNoClientSelectedOID(t *testing.T) {
 	}
 }
 
+// TestModbusEndpointsReadCacheOnly verifies existing source, metrics, discovery, aggregate, and status routes project cached Modbus state without a protocol-specific endpoint.
+func TestModbusEndpointsReadCacheOnly(t *testing.T) {
+	store := cache.New(time.Now)
+	store.Register("meter", "modbus_rtu", time.Minute)
+	store.SetDiscovery("meter", []metrics.Definition{{Name: "voltage", Type: "number", Unit: "V"}})
+	store.Success("meter", []metrics.Metric{{Name: "voltage", Value: float64(24.5), ValueType: "number", Unit: "V"}}, time.Millisecond)
+	hub := statusmodel.New(store, time.Now, 2)
+	t.Cleanup(hub.Close)
+	digest := sha256.Sum256([]byte("modbus-cache-token-value"))
+	handler := New(func() View {
+		return View{Store: store, Status: hub, TokenDigests: [][sha256.Size]byte{digest}, AllowedClients: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}}
+	}, Options{})
+	for _, path := range []string{
+		"/api/v1/sources", "/api/v1/sources/meter", "/api/v1/sources/meter/metrics",
+		"/api/v1/sources/meter/discovery", "/api/v1/metrics", "/api/v1/status",
+	} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request(http.MethodGet, path, "Bearer modbus-cache-token-value"))
+		if response.Code != http.StatusOK {
+			t.Fatalf("GET %s status=%d body=%s", path, response.Code, response.Body.String())
+		}
+		if !strings.Contains(response.Body.String(), "meter") && path != "/api/v1/metrics" {
+			t.Fatalf("GET %s omitted cached Modbus source: %s", path, response.Body.String())
+		}
+	}
+}
+
 // TestMethodAndUnknownSource verifies method rejection and missing-source status codes for authorized clients.
 func TestMethodAndUnknownSource(t *testing.T) {
 	h := testHandler()

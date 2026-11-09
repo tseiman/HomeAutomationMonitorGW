@@ -21,24 +21,54 @@ import (
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/cache"
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/config"
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/drivers"
+	"github.com/tseiman/HomeAutomationMonitorGW/internal/drivers/modbusrtu"
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/drivers/nut"
 	snmpdriver "github.com/tseiman/HomeAutomationMonitorGW/internal/drivers/snmp"
+	"github.com/tseiman/HomeAutomationMonitorGW/internal/metrics"
 	statusmodel "github.com/tseiman/HomeAutomationMonitorGW/internal/status"
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/tlsreload"
 )
 
 type sourceSpec struct {
-	name, driver                      string
-	interval, stale, discoveryTimeout time.Duration
-	collector                         drivers.Collector
-	discoverer                        drivers.Discoverer
-	identity                          [sha256.Size]byte
+	name, driver                               string
+	interval, stale, timeout, discoveryTimeout time.Duration
+	collector                                  drivers.Collector
+	discoverer                                 drivers.Discoverer
+	staticDiscovery                            []metrics.Definition
+	identity                                   [sha256.Size]byte
+}
+
+type modbusBus interface {
+	Reader(config.ModbusRTUSource) (modbusrtu.ReadTransport, error)
+	Close() error
+}
+
+type dependencies struct {
+	newModbusBus func() modbusBus
+}
+
+func defaultDependencies() dependencies {
+	return dependencies{newModbusBus: func() modbusBus { return modbusrtu.NewBusManager() }}
+}
+
+type preparedSources struct {
+	specs     []sourceSpec
+	resources []interface{ Close() error }
+}
+
+func (p preparedSources) close() error {
+	var joined error
+	for _, resource := range p.resources {
+		joined = errors.Join(joined, resource.Close())
+	}
+	return joined
 }
 
 type candidate struct {
-	cfg   config.Config
-	cert  *tls.Certificate
-	specs []sourceSpec
+	cfg       config.Config
+	cert      *tls.Certificate
+	specs     []sourceSpec
+	resources []interface{ Close() error }
 }
 
 type generation struct {
@@ -62,14 +92,17 @@ type RuntimeView struct {
 
 // Runtime owns the active generation and collector workers.
 type Runtime struct {
-	paths  []string
-	logger *slog.Logger
-	active atomic.Pointer[generation]
-	mu     sync.Mutex
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-	closed bool
-	done   chan struct{}
+	paths     []string
+	logger    *slog.Logger
+	deps      dependencies
+	active    atomic.Pointer[generation]
+	mu        sync.Mutex
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	resources []interface{ Close() error }
+	closed    bool
+	done      chan struct{}
+	closeErr  error
 }
 
 // Check prepares the configuration at path without starting collectors and returns any validation or referenced-file error.
@@ -80,7 +113,10 @@ func Check(path string) error {
 
 // CheckFiles prepares the ordered configuration stack without starting collectors.
 func CheckFiles(paths []string) error {
-	_, err := prepare(paths)
+	candidate, err := prepare(paths)
+	if err == nil {
+		err = candidate.close()
+	}
 	return err
 }
 
@@ -91,19 +127,28 @@ func New(path string, logger *slog.Logger) (*Runtime, error) {
 
 // NewFiles prepares ordered configuration layers and starts one runtime from their merged result.
 func NewFiles(paths []string, logger *slog.Logger) (*Runtime, error) {
-	cand, err := prepare(paths)
+	return newFilesWithDependencies(paths, logger, defaultDependencies())
+}
+
+func newFilesWithDependencies(paths []string, logger *slog.Logger, deps dependencies) (*Runtime, error) {
+	cand, err := prepareWithDependencies(paths, deps)
 	if err != nil {
 		return nil, err
 	}
-	runtime := &Runtime{paths: append([]string(nil), paths...), logger: logger}
+	runtime := &Runtime{paths: append([]string(nil), paths...), logger: logger, deps: deps}
 	active := buildGeneration(cand.cfg, cand.cert, cand.specs, nil)
 	runtime.active.Store(active)
+	runtime.resources = cand.resources
 	runtime.start(cand.specs, active.store, active.status)
 	return runtime, nil
 }
 
 // prepare loads path and builds a complete inactive candidate before active runtime state can change.
 func prepare(paths []string) (candidate, error) {
+	return prepareWithDependencies(paths, defaultDependencies())
+}
+
+func prepareWithDependencies(paths []string, deps dependencies) (candidate, error) {
 	cfg, err := config.LoadFiles(paths, true)
 	if err != nil {
 		return candidate{}, err
@@ -112,16 +157,30 @@ func prepare(paths []string) (candidate, error) {
 	if err != nil {
 		return candidate{}, err
 	}
-	specs, err := prepareSources(cfg)
+	prepared, err := prepareSourcesWithDependencies(cfg, deps)
 	if err != nil {
 		return candidate{}, err
 	}
-	return candidate{cfg: cfg, cert: cert, specs: specs}, nil
+	return candidate{cfg: cfg, cert: cert, specs: prepared.specs, resources: prepared.resources}, nil
+}
+
+func (c candidate) close() error {
+	return (preparedSources{resources: c.resources}).close()
 }
 
 // prepareSources translates every active generic source into a statically linked collector specification.
 func prepareSources(cfg config.Config) ([]sourceSpec, error) {
+	prepared, err := prepareSourcesWithDependencies(cfg, defaultDependencies())
+	if err != nil {
+		return nil, err
+	}
+	defer prepared.close()
+	return prepared.specs, nil
+}
+
+func prepareSourcesWithDependencies(cfg config.Config, deps dependencies) (preparedSources, error) {
 	var out []sourceSpec
+	var bus modbusBus
 	for _, source := range cfg.Sources {
 		if !source.Enabled {
 			continue
@@ -129,16 +188,22 @@ func prepareSources(cfg config.Config) ([]sourceSpec, error) {
 		switch source.Driver {
 		case "nut":
 			collector := nut.Collector{Client: nut.Client{Address: source.NUT.Server, Timeout: source.Timeout.Duration}, UPS: source.NUT.UPS}
-			out = append(out, sourceSpec{name: source.Name, driver: "nut", interval: source.PollInterval.Duration, stale: source.StaleAfter.Duration, collector: collector, identity: sourceIdentity(source, nil)})
+			out = append(out, sourceSpec{name: source.Name, driver: "nut", interval: source.PollInterval.Duration, stale: source.StaleAfter.Duration, timeout: source.Timeout.Duration, collector: collector, identity: sourceIdentity(source, nil)})
 		case "snmp":
 			meta, err := snmpdriver.LoadMetadata(source.SNMP.MetadataFile)
 			if err != nil {
-				return nil, fmt.Errorf("source %q metadata: %w", source.Name, err)
+				if bus != nil {
+					_ = bus.Close()
+				}
+				return preparedSources{}, fmt.Errorf("source %q metadata: %w", source.Name, err)
 			}
 			secrets := cfg.Secrets.Sources[source.Name]
 			client, err := snmpdriver.NewGoSNMP(source.SNMP.Address, source.SNMP.Port, source.SNMP.Security.Username, secrets.SNMPAuthPassphrase, secrets.SNMPPrivPassphrase, source.Timeout.Duration)
 			if err != nil {
-				return nil, fmt.Errorf("source %q: %w", source.Name, err)
+				if bus != nil {
+					_ = bus.Close()
+				}
+				return preparedSources{}, fmt.Errorf("source %q: %w", source.Name, err)
 			}
 			client.MaxOids = source.SNMP.MaxOIDsPerRequest
 			reader := &snmpdriver.GoSNMPReader{Template: client}
@@ -147,12 +212,44 @@ func prepareSources(cfg config.Config) ([]sourceSpec, error) {
 			if source.SNMP.Discovery.Enabled {
 				discoverer = collector
 			}
-			out = append(out, sourceSpec{name: source.Name, driver: "snmp", interval: source.PollInterval.Duration, stale: source.StaleAfter.Duration, discoveryTimeout: source.SNMP.Discovery.Timeout.Duration, collector: collector, discoverer: discoverer, identity: sourceIdentity(source, meta)})
+			out = append(out, sourceSpec{name: source.Name, driver: "snmp", interval: source.PollInterval.Duration, stale: source.StaleAfter.Duration, timeout: source.Timeout.Duration, discoveryTimeout: source.SNMP.Discovery.Timeout.Duration, collector: collector, discoverer: discoverer, identity: sourceIdentity(source, meta)})
+		case "modbus_rtu":
+			if bus == nil {
+				if deps.newModbusBus == nil {
+					return preparedSources{}, errors.New("Modbus bus factory is required")
+				}
+				bus = deps.newModbusBus()
+				if bus == nil {
+					return preparedSources{}, errors.New("Modbus bus factory returned nil")
+				}
+			}
+			reader, err := bus.Reader(*source.ModbusRTU)
+			if err != nil {
+				_ = bus.Close()
+				return preparedSources{}, fmt.Errorf("source %q: %w", source.Name, err)
+			}
+			collector, err := modbusrtu.NewCollector(reader, *source.ModbusRTU)
+			if err != nil {
+				_ = bus.Close()
+				return preparedSources{}, fmt.Errorf("source %q: %w", source.Name, err)
+			}
+			out = append(out, sourceSpec{
+				name: source.Name, driver: "modbus_rtu", interval: source.PollInterval.Duration,
+				stale: source.StaleAfter.Duration, timeout: source.Timeout.Duration, collector: collector,
+				staticDiscovery: modbusrtu.Definitions(source.ModbusRTU.Registers), identity: sourceIdentity(source, nil),
+			})
 		default:
-			return nil, fmt.Errorf("source %q has unsupported driver %q", source.Name, source.Driver)
+			if bus != nil {
+				_ = bus.Close()
+			}
+			return preparedSources{}, fmt.Errorf("source %q has unsupported driver %q", source.Name, source.Driver)
 		}
 	}
-	return out, nil
+	prepared := preparedSources{specs: out}
+	if bus != nil {
+		prepared.resources = append(prepared.resources, bus)
+	}
+	return prepared, nil
 }
 
 // sourceIdentity hashes non-secret source configuration and parsed metadata to constrain snapshot carryover.
@@ -181,6 +278,9 @@ func buildGeneration(cfg config.Config, cert *tls.Certificate, specs []sourceSpe
 				}
 			}
 		}
+		if spec.staticDiscovery != nil {
+			store.SetDiscovery(spec.name, spec.staticDiscovery)
+		}
 	}
 	digests := make([][sha256.Size]byte, len(cfg.Secrets.BearerTokens))
 	for index, token := range cfg.Secrets.BearerTokens {
@@ -196,31 +296,44 @@ func buildGeneration(cfg config.Config, cert *tls.Certificate, specs []sourceSpe
 
 // Reload prepares and atomically commits one complete cache, config, and authorization generation.
 func (r *Runtime) Reload() error {
-	cand, err := prepare(r.paths)
+	cand, err := prepareWithDependencies(r.paths, r.deps)
 	if err != nil {
 		return err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
+		_ = cand.close()
 		return errors.New("runtime is closed")
 	}
 	old := r.active.Load()
 	if old != nil && !reloadCompatible(old.cfg, cand.cfg) {
+		_ = cand.close()
 		return errors.New("server listener, timeouts, and header limit require restart")
 	}
+	next := buildGeneration(cand.cfg, cand.cert, cand.specs, old)
 	if r.cancel != nil {
 		r.cancel()
 		r.cancel = nil
 	}
-	next := buildGeneration(cand.cfg, cand.cert, cand.specs, old)
+	r.wg.Wait()
+	if err := closeResources(r.resources); err != nil {
+		_ = cand.close()
+		return fmt.Errorf("close old generation resources: %w", err)
+	}
+	r.resources = nil
 	if old != nil && old.status != nil {
 		old.status.Close()
 	}
 	// This single store prevents new credentials from ever observing an old or partially registered cache.
 	r.active.Store(next)
+	r.resources = cand.resources
 	r.startLocked(cand.specs, next.store, next.status)
 	return nil
+}
+
+func closeResources(resources []interface{ Close() error }) error {
+	return (preparedSources{resources: resources}).close()
 }
 
 // reloadCompatible compares settings that require rebuilding the HTTP server.
@@ -248,7 +361,7 @@ func (r *Runtime) startLocked(specs []sourceSpec, store *cache.Store, observer d
 		r.wg.Add(1)
 		go func(spec sourceSpec) {
 			defer r.wg.Done()
-			drivers.Run(ctx, spec.name, spec.interval, spec.collector, store, r.logger, observer)
+			drivers.RunWithTimeout(ctx, spec.name, spec.interval, spec.timeout, spec.collector, store, r.logger, observer)
 		}(spec)
 		if spec.discoverer != nil {
 			r.wg.Add(1)
@@ -286,10 +399,13 @@ func (r *Runtime) CloseContext(ctx context.Context) error {
 			r.cancel()
 			r.cancel = nil
 		}
+		resources := r.resources
+		r.resources = nil
 		r.done = make(chan struct{})
 		done := r.done
 		go func() {
 			r.wg.Wait()
+			r.closeErr = closeResources(resources)
 			close(done)
 		}()
 	}
@@ -297,7 +413,7 @@ func (r *Runtime) CloseContext(ctx context.Context) error {
 	r.mu.Unlock()
 	select {
 	case <-done:
-		return nil
+		return r.closeErr
 	case <-ctx.Done():
 		return ctx.Err()
 	}

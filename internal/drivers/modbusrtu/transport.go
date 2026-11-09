@@ -53,7 +53,7 @@ func newBusManager(opener sessionOpener) *BusManager {
 }
 
 // Reader returns a retrying read-only view over the shared physical bus described by source.
-func (m *BusManager) Reader(source config.ModbusRTUSource) (*Reader, error) {
+func (m *BusManager) Reader(source config.ModbusRTUSource) (ReadTransport, error) {
 	identity := canonicalBusPath(source.Device)
 	settings := serialSettings{device: source.Device, baudRate: source.BaudRate, dataBits: source.DataBits, stops: source.StopBits, parity: source.Parity}
 	m.mu.Lock()

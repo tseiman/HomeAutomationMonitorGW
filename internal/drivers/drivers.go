@@ -34,6 +34,11 @@ type PollObserver interface {
 
 // Run polls collector immediately and then at interval until ctx is canceled, updating store and logging every outcome when logger is provided.
 func Run(ctx context.Context, name string, interval time.Duration, collector Collector, store *cache.Store, logger *slog.Logger, observer PollObserver) {
+	RunWithTimeout(ctx, name, interval, 0, collector, store, logger, observer)
+}
+
+// RunWithTimeout behaves like Run and applies timeout as the budget for each complete poll when positive.
+func RunWithTimeout(ctx context.Context, name string, interval, timeout time.Duration, collector Collector, store *cache.Store, logger *slog.Logger, observer PollObserver) {
 	poll := func() {
 		if observer != nil {
 			observer.PollStarted(name)
@@ -43,7 +48,13 @@ func Run(ctx context.Context, name string, interval time.Duration, collector Col
 			logger.Debug("collector poll started", "source", name)
 		}
 		start := time.Now()
-		values, err := collector.Poll(ctx)
+		pollContext := ctx
+		cancel := func() {}
+		if timeout > 0 {
+			pollContext, cancel = context.WithTimeout(ctx, timeout)
+		}
+		values, err := collector.Poll(pollContext)
+		cancel()
 		duration := time.Since(start)
 		if err != nil {
 			// A failed poll changes availability but leaves the cached last-known-good metrics intact.
