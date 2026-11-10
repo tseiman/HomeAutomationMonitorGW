@@ -467,7 +467,7 @@ This is a one-time repository-administrator operation. The private signing key m
 3. Set **Name** to exactly `APT_SIGNING_PRIVATE_KEY`.
 4. Open the downloaded `homeautomationmonitorgw-archive-private-key.asc` as text, copy its complete ASCII-armored contents including the `-----BEGIN PGP PRIVATE KEY BLOCK-----` and `-----END PGP PRIVATE KEY BLOCK-----` lines into **Secret**, and select **Add secret**.
 5. Confirm that `APT_SIGNING_PRIVATE_KEY` is listed under **Repository secrets**. GitHub will not display its value again.
-6. Open **Settings → Pages → Build and deployment**, set **Source** to **GitHub Actions**, and save if GitHub presents a save button.
+6. Open **Settings → Pages → Build and deployment** and set **Source** to **GitHub Actions**. When that value is already selected, Pages is configured for the repository workflow: do **not** select **Configure** for the suggested Jekyll or Static HTML templates, do not create another workflow, and leave **Custom domain** empty unless this repository is intentionally assigned one. The existing tagged-release workflow will populate the deployment details after its first successful APT publication.
 
 Do not create an environment-scoped secret for this workflow: the signing job does not target an environment, so it reads only the repository secret. The separate `github-pages` environment is used by the later deployment job and does not need the private key.
 
