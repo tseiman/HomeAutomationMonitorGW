@@ -24,13 +24,16 @@ type templateDocument struct {
 		} `yaml:"template_groups"`
 		Templates []struct {
 			Items []struct {
-				Name      string `yaml:"name"`
-				Type      string `yaml:"type"`
-				Key       string `yaml:"key"`
-				URL       string `yaml:"url"`
-				ValueType string `yaml:"value_type"`
-				Units     string `yaml:"units"`
-				ValueMap  struct {
+				UUID         string `yaml:"uuid"`
+				Name         string `yaml:"name"`
+				Type         string `yaml:"type"`
+				Key          string `yaml:"key"`
+				URL          string `yaml:"url"`
+				AllowedHosts string `yaml:"allowed_hosts"`
+				Status       string `yaml:"status"`
+				ValueType    string `yaml:"value_type"`
+				Units        string `yaml:"units"`
+				ValueMap     struct {
 					Name string `yaml:"name"`
 				} `yaml:"valuemap"`
 				MasterItem struct {
@@ -57,11 +60,15 @@ type templateDocument struct {
 					Key string `yaml:"key"`
 				} `yaml:"master_item"`
 				ItemPrototypes []struct {
-					Name       string `yaml:"name"`
-					Key        string `yaml:"key"`
-					ValueType  string `yaml:"value_type"`
-					Trends     string `yaml:"trends"`
-					MasterItem struct {
+					UUID         string `yaml:"uuid"`
+					Name         string `yaml:"name"`
+					Type         string `yaml:"type"`
+					Key          string `yaml:"key"`
+					AllowedHosts string `yaml:"allowed_hosts"`
+					Status       string `yaml:"status"`
+					ValueType    string `yaml:"value_type"`
+					Trends       string `yaml:"trends"`
+					MasterItem   struct {
 						Key string `yaml:"key"`
 					} `yaml:"master_item"`
 					Preprocessing []struct {
@@ -128,7 +135,7 @@ func TestTemplateUsesOneHTTPSMasterAndDependentDiscovery(t *testing.T) {
 		t.Fatalf("template groups=%+v", document.Export.TemplateGroups)
 	}
 	template := document.Export.Templates[0]
-	if len(template.Items) != 26 || template.Items[0].Type != "HTTP_AGENT" || template.Items[0].Key != "automation.gateway.snapshot" || !strings.HasSuffix(template.Items[0].URL, "/api/v1/metrics") {
+	if len(template.Items) != 26 || template.Items[0].Type != "TRAP" || template.Items[0].Key != "automation.gateway.snapshot" || template.Items[0].AllowedHosts != "{$AUTOMATION_GATEWAY_ALLOWED_HOSTS}" {
 		t.Fatalf("master items=%+v", template.Items)
 	}
 	for _, item := range template.Items[1:] {
@@ -136,8 +143,8 @@ func TestTemplateUsesOneHTTPSMasterAndDependentDiscovery(t *testing.T) {
 			t.Fatalf("device item is not dependent-only: %+v", item)
 		}
 	}
-	if len(template.Items[0].Headers) != 1 || template.Items[0].Headers[0].Name != "Authorization" || template.Items[0].Headers[0].Value != "Bearer {$AUTOMATION_GATEWAY_TOKEN}" {
-		t.Fatalf("headers=%+v", template.Items[0].Headers)
+	if len(template.Items[0].Headers) != 0 {
+		t.Fatalf("trapper snapshot unexpectedly has HTTP headers=%+v", template.Items[0].Headers)
 	}
 	if len(template.Items[0].Preprocessing) != 1 || template.Items[0].Preprocessing[0].Type != "JAVASCRIPT" || len(template.Items[0].Preprocessing[0].Parameters) != 1 {
 		t.Fatalf("master preprocessing=%+v", template.Items[0].Preprocessing)
@@ -159,8 +166,12 @@ func TestTemplateUsesOneHTTPSMasterAndDependentDiscovery(t *testing.T) {
 			if prototype.Key == `automation.gateway.source.health["{#SOURCE}"]` {
 				foundGenericHealth = true
 			}
-			if prototype.MasterItem.Key != "automation.gateway.snapshot" {
-				t.Fatalf("prototype %q master=%q", prototype.Key, prototype.MasterItem.Key)
+			if strings.Contains(prototype.Key, ".timestamp[") {
+				if prototype.MasterItem.Key != "automation.gateway.snapshot" || prototype.Status != "DISABLED" {
+					t.Fatalf("deprecated timestamp prototype changed: %+v", prototype)
+				}
+			} else if prototype.MasterItem.Key != "" || prototype.Type != "TRAP" {
+				t.Fatalf("prototype is not a trapper: %+v", prototype)
 			}
 			if strings.HasPrefix(prototype.Key, "automation.gateway.metric") && !strings.Contains(prototype.Key, "{#METRIC_KEY}") {
 				t.Fatalf("metric prototype uses unsafe identity: %q", prototype.Key)
@@ -176,14 +187,14 @@ func TestTemplateUsesOneHTTPSMasterAndDependentDiscovery(t *testing.T) {
 	if !foundGenericHealth {
 		t.Fatal("missing per-source generic health prototype")
 	}
-	foundSecret := false
+	foundAllowedHosts := false
 	for _, macro := range template.Macros {
-		if macro.Macro == "{$AUTOMATION_GATEWAY_TOKEN}" {
-			foundSecret = macro.Type == "SECRET_TEXT" && macro.Value == ""
+		if macro.Macro == "{$AUTOMATION_GATEWAY_ALLOWED_HOSTS}" {
+			foundAllowedHosts = macro.Value == "127.0.0.1"
 		}
 	}
-	if !foundSecret {
-		t.Fatal("missing valueless SECRET_TEXT token macro")
+	if !foundAllowedHosts {
+		t.Fatal("missing safe default allowed-hosts macro")
 	}
 }
 
@@ -337,12 +348,8 @@ func TestMasterJavaScriptRejectsInvalidPayloads(t *testing.T) {
 	}
 }
 
-// TestLastSuccessJavaScriptHandlesNeverSuccessfulSources verifies zero time has a supported sentinel.
-func TestLastSuccessJavaScriptHandlesNeverSuccessfulSources(t *testing.T) {
-	node, err := exec.LookPath("node")
-	if err != nil {
-		t.Skip("node is not installed")
-	}
+// TestLastSuccessIsBridgeFed verifies source timestamps are direct trapper values.
+func TestLastSuccessIsBridgeFed(t *testing.T) {
 	data, err := os.ReadFile("template_homeauthmonitorgw.yaml")
 	if err != nil {
 		t.Fatal(err)
@@ -351,30 +358,17 @@ func TestLastSuccessJavaScriptHandlesNeverSuccessfulSources(t *testing.T) {
 	if err := yaml.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	var scriptBody string
 	for _, rule := range document.Export.Templates[0].DiscoveryRules {
 		for _, prototype := range rule.ItemPrototypes {
-			if strings.HasPrefix(prototype.Key, "automation.gateway.source.last_success[") && len(prototype.Preprocessing) == 2 {
-				scriptBody = prototype.Preprocessing[1].Parameters[0]
+			if strings.HasPrefix(prototype.Key, "automation.gateway.source.last_success[") {
+				if prototype.Type != "TRAP" || len(prototype.Preprocessing) != 0 {
+					t.Fatalf("last_success is not a direct trapper: %+v", prototype)
+				}
+				return
 			}
 		}
 	}
-	if scriptBody == "" {
-		t.Fatal("last_success JavaScript preprocessing not found")
-	}
-	script := "const value = process.argv[1]; function transform() {\n" + scriptBody + "\n} process.stdout.write(String(transform()));"
-	for input, expected := range map[string]string{
-		"0001-01-01T00:00:00Z": "0",
-		"2026-10-04T00:00:00Z": "1791072000",
-	} {
-		output, err := exec.Command(node, "-e", script, input).CombinedOutput()
-		if err != nil || string(output) != expected {
-			t.Fatalf("input=%q error=%v output=%q", input, err, output)
-		}
-	}
-	if output, err := exec.Command(node, "-e", script, "invalid").CombinedOutput(); err == nil {
-		t.Fatalf("invalid timestamp accepted with output %q", output)
-	}
+	t.Fatal("last_success prototype not found")
 }
 
 // TestDeviceDashboardsExposeStableHumanReadableKPIs verifies both device views use stable core items while LLD retains detail metrics.
@@ -891,34 +885,16 @@ func TestDeviceHealthJavaScriptScoresCollectorsIndependently(t *testing.T) {
 			t.Fatalf("key=%q want=%q error=%v output=%q", test.key, test.want, err, output)
 		}
 	}
-	var genericName, genericScript string
+	foundGenericHealth := false
 	for _, rule := range document.Export.Templates[0].DiscoveryRules {
 		for _, prototype := range rule.ItemPrototypes {
-			if prototype.Key != `automation.gateway.source.health["{#SOURCE}"]` {
-				continue
-			}
-			genericName = prototype.Name
-			for _, preprocessing := range prototype.Preprocessing {
-				if preprocessing.Type == "JAVASCRIPT" {
-					genericScript = preprocessing.Parameters[0]
-				}
+			if prototype.Key == `automation.gateway.source.health["{#SOURCE}"]` {
+				foundGenericHealth = prototype.Name == "TS Service health: {#SOURCE}" && prototype.Type == "TRAP" && len(prototype.Preprocessing) == 0
 			}
 		}
 	}
-	if genericName != "TS Service health: {#SOURCE}" || genericScript == "" {
-		t.Fatalf("generic health name=%q script=%q", genericName, genericScript)
-	}
-	for source, want := range map[string]string{
-		`{"available":true,"stale":false,"last_success":"2026-10-04T00:00:00Z","metrics":[{"name":"metric","value":1}]}`: "0",
-		`{"available":true,"stale":true,"last_success":"2026-10-04T00:00:00Z","metrics":[{"name":"metric","value":1}]}`:  "1",
-		`{"available":true,"stale":false,"last_success":"2026-10-04T00:00:00Z","metrics":[]}`:                            "1",
-		`{"available":false,"stale":true,"last_success":"2026-10-04T00:00:00Z","metrics":[{"name":"metric","value":1}]}`: "2",
-	} {
-		script := "const value = process.argv[1]; function transform() {\n" + genericScript + "\n} process.stdout.write(String(transform()));"
-		output, err := exec.Command(node, "-e", script, source).CombinedOutput()
-		if err != nil || string(output) != want {
-			t.Fatalf("generic health source=%q want=%q error=%v output=%q", source, want, err, output)
-		}
+	if !foundGenericHealth {
+		t.Fatal("generic health is not a direct bridge-fed trapper")
 	}
 }
 

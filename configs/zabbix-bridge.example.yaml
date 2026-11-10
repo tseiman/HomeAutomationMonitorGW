@@ -1,0 +1,15 @@
+# External Zabbix delta bridge; token files must be regular mode-0600 files.
+gateway_url: https://gateway.example.invalid
+gateway_ca_file: /etc/automation-gateway-zabbix/gateway-ca.pem
+gateway_token_file: /etc/automation-gateway-zabbix/gateway.token
+zabbix_api_url: https://zabbix.example.invalid/api_jsonrpc.php
+zabbix_ca_file: /etc/automation-gateway-zabbix/zabbix-ca.pem
+zabbix_token_file: /etc/automation-gateway-zabbix/zabbix.token
+zabbix_host: automation-gateway
+poll_interval: 5s
+inventory_interval: 15m
+request_timeout: 10s
+cursor_state_path: /var/lib/automation-gateway-zabbix/cursor
+batch_size: 100
+max_pages: 100
+max_response_bytes: 8388608

@@ -7,29 +7,18 @@ zabbix_export:
     - uuid: 60d4f3523b094da0a49b477eba03ee37
       template: 'Template HomeAuthMonitorGW by HTTP'
       name: 'Template HomeAuthMonitorGW by HTTP'
-      description: 'Read-only monitoring through one authenticated HomeAuthMonitorGW HTTPS cache snapshot.'
+      description: 'Read-only monitoring fed by the persistent authenticated gateway-to-Zabbix delta bridge; complete inventory snapshots drive dependent items and discovery.'
       groups:
         - name: Templates/HomeAuthMonitorGW
       items:
         - uuid: a70ce834f05e40b3afc07eaf63b44e9c
           name: 'Automation gateway snapshot'
-          type: HTTP_AGENT
+          type: TRAP
           key: automation.gateway.snapshot
-          delay: '{$AUTOMATION_GATEWAY_INTERVAL}'
+          allowed_hosts: '{$AUTOMATION_GATEWAY_ALLOWED_HOSTS}'
           history: '1d'
           trends: '0'
           value_type: TEXT
-          url: '{$AUTOMATION_GATEWAY_URL}/api/v1/metrics'
-          status_codes: '200'
-          follow_redirects: 'NO'
-          retrieve_mode: BODY
-          output_format: RAW
-          timeout: '{$AUTOMATION_GATEWAY_TIMEOUT}'
-          verify_peer: 'YES'
-          verify_host: 'YES'
-          headers:
-            - name: Authorization
-              value: 'Bearer {$AUTOMATION_GATEWAY_TOKEN}'
           preprocessing:
             - type: JAVASCRIPT
               parameters:
@@ -70,7 +59,7 @@ zabbix_export:
               expression: 'nodata(/Template HomeAuthMonitorGW by HTTP/automation.gateway.snapshot,5m)=1'
               name: 'Automation gateway has no snapshot data for 5 minutes'
               priority: HIGH
-              description: 'The authenticated HTTPS master item has produced no value for five minutes. Check TLS, allowlist, token, and gateway availability.'
+              description: 'The external bridge has submitted no complete inventory snapshot for five minutes. Check both HTTPS trust/authentication paths, trapper allowed hosts, bridge state, and service availability.'
         - uuid: 1e0f1d2b76894e31ad44529eb2f21f4d
           name: 'TS Service health: HeimAuto'
           type: DEPENDENT
@@ -957,21 +946,13 @@ zabbix_export:
           item_prototypes:
             - uuid: 73161e1d7ef64caf9a7619927f0e98b8
               name: 'Source {#SOURCE}: available'
-              type: DEPENDENT
+              type: TRAP
               key: 'automation.gateway.source.available["{#SOURCE}"]'
+              allowed_hosts: '{$AUTOMATION_GATEWAY_ALLOWED_HOSTS}'
               history: '7d'
               trends: '30d'
               value_type: UNSIGNED
               description: 'One means the most recent collector attempt succeeded; zero means it failed.'
-              master_item:
-                key: automation.gateway.snapshot
-              preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - '{#SOURCEPATH}.available'
-                - type: JAVASCRIPT
-                  parameters:
-                    - 'return value === "true" ? 1 : 0;'
               tags:
                 - tag: component
                   value: source
@@ -981,21 +962,13 @@ zabbix_export:
                   value: '{#DRIVER}'
             - uuid: e58ffbd0227f4a409012c6e5a36ff2cb
               name: 'Source {#SOURCE}: stale'
-              type: DEPENDENT
+              type: TRAP
               key: 'automation.gateway.source.stale["{#SOURCE}"]'
+              allowed_hosts: '{$AUTOMATION_GATEWAY_ALLOWED_HOSTS}'
               history: '7d'
               trends: '30d'
               value_type: UNSIGNED
               description: 'One means cached source values exceed their configured freshness threshold.'
-              master_item:
-                key: automation.gateway.snapshot
-              preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - '{#SOURCEPATH}.stale'
-                - type: JAVASCRIPT
-                  parameters:
-                    - 'return value === "true" ? 1 : 0;'
               tags:
                 - tag: component
                   value: source
@@ -1005,30 +978,14 @@ zabbix_export:
                   value: '{#DRIVER}'
             - uuid: 60142c963f2b4a7980c2fc1c93f613da
               name: 'Source {#SOURCE}: unavailable since'
-              type: DEPENDENT
+              type: TRAP
               key: 'automation.gateway.source.unavailable_since["{#SOURCE}"]'
+              allowed_hosts: '{$AUTOMATION_GATEWAY_ALLOWED_HOSTS}'
               history: '7d'
               trends: '30d'
               value_type: UNSIGNED
               units: unixtime
               description: 'UTC Unix time of the first failed collector poll in the current uninterrupted outage; zero while available.'
-              master_item:
-                key: automation.gateway.snapshot
-              preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - '{#SOURCEPATH}.unavailable_since'
-                - type: JAVASCRIPT
-                  parameters:
-                    - |
-                      if (value === '0001-01-01T00:00:00Z') {
-                          return 0;
-                      }
-                      var timestamp = Date.parse(value);
-                      if (isNaN(timestamp) || timestamp < 0) {
-                          throw 'invalid unavailable_since timestamp';
-                      }
-                      return Math.floor(timestamp / 1000);
               tags:
                 - tag: component
                   value: source
@@ -1038,28 +995,15 @@ zabbix_export:
                   value: '{#DRIVER}'
             - uuid: c90c81ede4ab442aa1d58255fe185abb
               name: 'TS Service health: {#SOURCE}'
-              type: DEPENDENT
+              type: TRAP
               key: 'automation.gateway.source.health["{#SOURCE}"]'
+              allowed_hosts: '{$AUTOMATION_GATEWAY_ALLOWED_HOSTS}'
               history: '30d'
               trends: '365d'
               value_type: UNSIGNED
               description: 'Independent generic health for this collector: 0 good, 1 degraded, 2 real issue or unavailable.'
               valuemap:
                 name: 'Collector health'
-              master_item:
-                key: automation.gateway.snapshot
-              preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - '{#SOURCEPATH}'
-                - type: JAVASCRIPT
-                  parameters:
-                    - |
-                      var source = JSON.parse(value);
-                      if (!source.last_success || source.last_success === '0001-01-01T00:00:00Z') return 1;
-                      if (!source.available) return 2;
-                      if (source.stale || source.metrics.length === 0) return 1;
-                      return 0;
               tags:
                 - tag: component
                   value: health
@@ -1069,30 +1013,14 @@ zabbix_export:
                   value: '{#DRIVER}'
             - uuid: 9aae70fb921846059e08c2982cfddf06
               name: 'Source {#SOURCE}: last successful poll'
-              type: DEPENDENT
+              type: TRAP
               key: 'automation.gateway.source.last_success["{#SOURCE}"]'
+              allowed_hosts: '{$AUTOMATION_GATEWAY_ALLOWED_HOSTS}'
               history: '7d'
               trends: '30d'
               value_type: UNSIGNED
               units: unixtime
               description: 'UTC Unix time of the last successful collector poll.'
-              master_item:
-                key: automation.gateway.snapshot
-              preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - '{#SOURCEPATH}.last_success'
-                - type: JAVASCRIPT
-                  parameters:
-                    - |
-                      if (value === '0001-01-01T00:00:00Z') {
-                          return 0;
-                      }
-                      var timestamp = Date.parse(value);
-                      if (isNaN(timestamp) || timestamp < 0) {
-                          throw 'invalid last_success timestamp';
-                      }
-                      return Math.floor(timestamp / 1000);
               tags:
                 - tag: component
                   value: source
@@ -1161,18 +1089,13 @@ zabbix_export:
           item_prototypes:
             - uuid: 12f9b6497de6437dba2009e0142f3e52
               name: 'Source {#SOURCE}: metric {#METRIC}'
-              type: DEPENDENT
+              type: TRAP
               key: 'automation.gateway.metric["{#SOURCE}","{#METRIC_KEY}"]'
+              allowed_hosts: '{$AUTOMATION_GATEWAY_ALLOWED_HOSTS}'
               history: '7d'
               trends: '0'
               value_type: TEXT
               description: '{#DESCRIPTION}'
-              master_item:
-                key: automation.gateway.snapshot
-              preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - '{#VALUE_JSONPATH}'
               tags:
                 - tag: component
                   value: metric
@@ -1188,11 +1111,12 @@ zabbix_export:
               name: 'Source {#SOURCE}: metric {#METRIC} timestamp'
               type: DEPENDENT
               key: 'automation.gateway.metric.timestamp["{#SOURCE}","{#METRIC_KEY}"]'
+              status: DISABLED
               history: '7d'
               trends: '30d'
               value_type: UNSIGNED
               units: unixtime
-              description: 'UTC Unix time attached to the cached metric value.'
+              description: 'Deprecated: metric timestamps are carried by each history.push value clock/ns.'
               master_item:
                 key: automation.gateway.snapshot
               preprocessing:
@@ -1275,19 +1199,15 @@ zabbix_export:
           item_prototypes:
             - uuid: 0ace423d3a7b4ce6881b42a2528dadf5
               name: 'Source {#SOURCE}: metric {#METRIC}'
-              type: DEPENDENT
+              type: TRAP
               key: 'automation.gateway.metric.numeric["{#SOURCE}","{#METRIC_KEY}"]'
+              allowed_hosts: '{$AUTOMATION_GATEWAY_ALLOWED_HOSTS}'
               history: '30d'
               trends: '365d'
               value_type: FLOAT
               units: '{#DISPLAY_UNIT}'
               description: '{#DESCRIPTION}'
-              master_item:
-                key: automation.gateway.snapshot
               preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - '{#VALUE_JSONPATH}'
                 - type: MULTIPLIER
                   parameters:
                     - '{#MULTIPLIER}'
@@ -1306,11 +1226,12 @@ zabbix_export:
               name: 'Source {#SOURCE}: metric {#METRIC} timestamp'
               type: DEPENDENT
               key: 'automation.gateway.metric.numeric.timestamp["{#SOURCE}","{#METRIC_KEY}"]'
+              status: DISABLED
               history: '7d'
               trends: '30d'
               value_type: UNSIGNED
               units: unixtime
-              description: 'UTC Unix time attached to the cached numeric metric value.'
+              description: 'Deprecated: metric timestamps are carried by each history.push value clock/ns.'
               master_item:
                 key: automation.gateway.snapshot
               preprocessing:
@@ -1349,7 +1270,7 @@ zabbix_export:
                           if (!metric || typeof metric.name !== 'string') {
                               return;
                           }
-                          if (metric.value_type !== 'integer' && metric.value_type !== 'counter' && metric.value_type !== 'number') {
+                          if (metric.value_type !== 'integer' && metric.value_type !== 'counter' && metric.value_type !== 'number' && metric.value_type !== 'boolean') {
                               return;
                           }
                           var metricID = metric.name;
@@ -1390,18 +1311,12 @@ zabbix_export:
                   });
                   return JSON.stringify(discovered);
       macros:
-        - macro: '{$AUTOMATION_GATEWAY_URL}'
-          value: 'https://monitor.example.invalid'
-          description: 'HTTPS origin only, without a trailing slash.'
-        - macro: '{$AUTOMATION_GATEWAY_TOKEN}'
-          type: SECRET_TEXT
-          description: 'Bearer token authorized by the gateway. Set at the narrowest appropriate host or template scope.'
+        - macro: '{$AUTOMATION_GATEWAY_ALLOWED_HOSTS}'
+          value: '127.0.0.1'
+          description: 'Comma-delimited Zabbix bridge or frontend addresses allowed to submit trapper values. Override at host scope for a remote bridge.'
         - macro: '{$AUTOMATION_GATEWAY_INTERVAL}'
-          value: '30s'
-          description: 'Master item interval; do not set below the useful collector interval.'
-        - macro: '{$AUTOMATION_GATEWAY_TIMEOUT}'
-          value: '10s'
-          description: 'HTTPS timeout, shorter than the master item interval.'
+          value: '15m'
+          description: 'Inventory cadence for complete snapshots submitted by the external bridge; configure the daemon to match.'
         - macro: '{$WAGO_SOURCE}'
           value: 'wago-750-880-snmp3'
           description: 'Gateway source name used by the WAGO core items and dashboard.'
