@@ -28,6 +28,7 @@ type templateDocument struct {
 				Type       string `yaml:"type"`
 				Key        string `yaml:"key"`
 				URL        string `yaml:"url"`
+				Delay      string `yaml:"delay"`
 				VerifyPeer string `yaml:"verify_peer"`
 				VerifyHost string `yaml:"verify_host"`
 				ValueType  string `yaml:"value_type"`
@@ -43,8 +44,9 @@ type templateDocument struct {
 					Value string `yaml:"value"`
 				} `yaml:"headers"`
 				Preprocessing []struct {
-					Type       string   `yaml:"type"`
-					Parameters []string `yaml:"parameters"`
+					Type         string   `yaml:"type"`
+					ErrorHandler string   `yaml:"error_handler"`
+					Parameters   []string `yaml:"parameters"`
 				} `yaml:"preprocessing"`
 				Triggers []struct {
 					Name       string `yaml:"name"`
@@ -63,12 +65,15 @@ type templateDocument struct {
 					Key        string `yaml:"key"`
 					ValueType  string `yaml:"value_type"`
 					Trends     string `yaml:"trends"`
+					Discover   string `yaml:"discover"`
+					Status     string `yaml:"status"`
 					MasterItem struct {
 						Key string `yaml:"key"`
 					} `yaml:"master_item"`
 					Preprocessing []struct {
-						Type       string   `yaml:"type"`
-						Parameters []string `yaml:"parameters"`
+						Type         string   `yaml:"type"`
+						ErrorHandler string   `yaml:"error_handler"`
+						Parameters   []string `yaml:"parameters"`
 					} `yaml:"preprocessing"`
 				} `yaml:"item_prototypes"`
 				TriggerPrototypes []struct {
@@ -76,8 +81,9 @@ type templateDocument struct {
 					Priority   string `yaml:"priority"`
 				} `yaml:"trigger_prototypes"`
 				Preprocessing []struct {
-					Type       string   `yaml:"type"`
-					Parameters []string `yaml:"parameters"`
+					Type         string   `yaml:"type"`
+					ErrorHandler string   `yaml:"error_handler"`
+					Parameters   []string `yaml:"parameters"`
 				} `yaml:"preprocessing"`
 			} `yaml:"discovery_rules"`
 			Macros []struct {
@@ -113,6 +119,73 @@ type templateDocument struct {
 	} `yaml:"zabbix_export"`
 }
 
+func fullPollProjection(t testing.TB, payload string) string {
+	t.Helper()
+	var projected map[string]any
+	if err := json.Unmarshal([]byte(payload), &projected); err != nil {
+		t.Fatalf("parse projected full poll: %v", err)
+	}
+	projected["__poll_mode"] = "full"
+	encoded, err := json.Marshal(projected)
+	if err != nil {
+		t.Fatalf("encode projected full poll: %v", err)
+	}
+	return string(encoded)
+}
+
+func TestTemplateUsesNativeTokenPollAndKeepsTimestampPrototypesDisabled(t *testing.T) {
+	data, err := os.ReadFile("template_homeauthmonitorgw.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document templateDocument
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	template := document.Export.Templates[0]
+	master := template.Items[0]
+	if master.Type != "HTTP_AGENT" || master.Delay != "{$AUTOMATION_GATEWAY_INTERVAL}" || !strings.HasSuffix(master.URL, "/api/v1/metrics/poll") {
+		t.Fatalf("master=%+v", master)
+	}
+	if len(master.Preprocessing) != 1 || master.Preprocessing[0].ErrorHandler != "DISCARD_VALUE" {
+		t.Fatalf("master must discard empty sparse values: %+v", master.Preprocessing)
+	}
+	for _, item := range template.Items[1:] {
+		for _, step := range item.Preprocessing {
+			if step.Type == "JSONPATH" && step.ErrorHandler != "DISCARD_VALUE" {
+				t.Fatalf("static item missing sparse value is not discarded: %s", item.Key)
+			}
+		}
+	}
+	for _, macro := range template.Macros {
+		if macro.Macro == "{$AUTOMATION_GATEWAY_INTERVAL}" && macro.Value != "5s" {
+			t.Fatalf("poll interval=%q", macro.Value)
+		}
+	}
+	found := 0
+	for _, rule := range template.DiscoveryRules {
+		if len(rule.Preprocessing) != 1 || rule.Preprocessing[0].ErrorHandler != "DISCARD_VALUE" {
+			t.Fatalf("discovery sparse failure is not discarded: %+v", rule.Preprocessing)
+		}
+		for _, prototype := range rule.ItemPrototypes {
+			for _, step := range prototype.Preprocessing {
+				if step.Type == "JSONPATH" && step.ErrorHandler != "DISCARD_VALUE" {
+					t.Fatalf("missing sparse value is not discarded: %+v", prototype)
+				}
+			}
+			if strings.Contains(prototype.Key, ".timestamp[") {
+				found++
+				if prototype.Discover != "NO" || prototype.Status != "DISABLED" {
+					t.Fatalf("timestamp prototype enabled: %+v", prototype)
+				}
+			}
+		}
+	}
+	if found != 2 {
+		t.Fatalf("timestamp prototype count=%d", found)
+	}
+}
+
 // TestTemplateUsesOneHTTPSMasterAndDependentDiscovery verifies the intended cache-efficient topology.
 func TestTemplateUsesOneHTTPSMasterAndDependentDiscovery(t *testing.T) {
 	data, err := os.ReadFile("template_homeauthmonitorgw.yaml")
@@ -130,7 +203,7 @@ func TestTemplateUsesOneHTTPSMasterAndDependentDiscovery(t *testing.T) {
 		t.Fatalf("template groups=%+v", document.Export.TemplateGroups)
 	}
 	template := document.Export.Templates[0]
-	if len(template.Items) != 26 || template.Items[0].Type != "HTTP_AGENT" || template.Items[0].Key != "automation.gateway.snapshot" || !strings.HasSuffix(template.Items[0].URL, "/api/v1/metrics/all") || template.Items[0].VerifyPeer != "YES" || template.Items[0].VerifyHost != "YES" {
+	if len(template.Items) != 26 || template.Items[0].Type != "HTTP_AGENT" || template.Items[0].Key != "automation.gateway.snapshot" || !strings.HasSuffix(template.Items[0].URL, "/api/v1/metrics/poll") || template.Items[0].VerifyPeer != "YES" || template.Items[0].VerifyHost != "YES" {
 		t.Fatalf("master items=%+v", template.Items)
 	}
 	for _, item := range template.Items[1:] {
@@ -240,7 +313,7 @@ func TestDiscoveryJavaScriptTransformsSnapshot(t *testing.T) {
 	if err := yaml.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	snapshot := `{"controller-main":{"driver":"snmp","available":true,"stale":false,"last_success":"2026-10-04T00:00:00Z","unavailable_since":"0001-01-01T00:00:00Z","metrics":[{"name":"sysUpTime","value":123,"value_type":"counter","unit":"centiseconds","description":"SNMP uptime","timestamp":"2026-10-04T00:00:00Z","labels":{"oid":"1.3.6.1.2.1.1.3.0"}},{"name":"display.name","value":"device","value_type":"string","timestamp":"2026-10-04T00:00:00Z"}]},"sirax-dc":{"driver":"modbus_rtu","available":true,"stale":false,"last_success":"2026-10-04T00:00:00Z","unavailable_since":"0001-01-01T00:00:00Z","metrics":[{"name":"status","value":3,"value_type":"integer","description":"DC measurement status","timestamp":"2026-10-04T00:00:00Z"},{"name":"voltage","value":23.54,"value_type":"number","unit":"V","description":"DC voltage","timestamp":"2026-10-04T00:00:00Z"}]}}`
+	snapshot := `{"__poll_mode":"full","controller-main":{"driver":"snmp","available":true,"stale":false,"last_success":"2026-10-04T00:00:00Z","unavailable_since":"0001-01-01T00:00:00Z","metrics":[{"name":"sysUpTime","value":123,"value_type":"counter","unit":"centiseconds","description":"SNMP uptime","timestamp":"2026-10-04T00:00:00Z","labels":{"oid":"1.3.6.1.2.1.1.3.0"}},{"name":"display.name","value":"device","value_type":"string","timestamp":"2026-10-04T00:00:00Z"}]},"sirax-dc":{"driver":"modbus_rtu","available":true,"stale":false,"last_success":"2026-10-04T00:00:00Z","unavailable_since":"0001-01-01T00:00:00Z","metrics":[{"name":"status","value":3,"value_type":"integer","description":"DC measurement status","timestamp":"2026-10-04T00:00:00Z"},{"name":"voltage","value":23.54,"value_type":"number","unit":"V","description":"DC voltage","timestamp":"2026-10-04T00:00:00Z"}]}}`
 	for _, rule := range document.Export.Templates[0].DiscoveryRules {
 		script := "const value = process.argv[1]; function transform() {\n" + rule.Preprocessing[0].Parameters[0] + "\n} process.stdout.write(transform());"
 		output, err := exec.Command(node, "-e", script, snapshot).CombinedOutput()
@@ -318,8 +391,8 @@ func TestMasterJavaScriptRejectsInvalidPayloads(t *testing.T) {
 		t.Fatal(err)
 	}
 	script := "const value = process.argv[1]; function transform() {\n" + document.Export.Templates[0].Items[0].Preprocessing[0].Parameters[0] + "\n} process.stdout.write(transform());"
-	legacy := `{"source-one":{"name":"source-one","driver":"nut","available":false,"stale":true,"last_success":"0001-01-01T00:00:00Z","unavailable_since":"2026-10-07T12:00:00Z","metrics":[]}}`
-	valid := `{"schema_version":1,"generation":"test","cursor":"v1.test.1","captured_at":"2026-10-07T12:00:00Z","sources":[{"name":"source-one","driver":"nut","available":false,"stale":true,"last_success":"0001-01-01T00:00:00Z","unavailable_since":"2026-10-07T12:00:00Z","metrics":[]}]}`
+	legacy := `{"source-one":{"name":"source-one","driver":"nut","available":false,"stale":true,"last_success":"0001-01-01T00:00:00Z","unavailable_since":"2026-10-07T12:00:00Z","metrics":[]},"__poll_mode":"full"}`
+	valid := `{"schema_version":1,"mode":"full","generation":"test","cursor":"v1.test.1","captured_at":"2026-10-07T12:00:00Z","sources":[{"name":"source-one","driver":"nut","available":false,"stale":true,"last_success":"0001-01-01T00:00:00Z","unavailable_since":"2026-10-07T12:00:00Z","metrics":[]}]}`
 	output, err := exec.Command(node, "-e", script, valid).CombinedOutput()
 	if err != nil || string(output) != legacy {
 		t.Fatalf("valid payload: %v output=%q", err, output)
@@ -337,6 +410,109 @@ func TestMasterJavaScriptRejectsInvalidPayloads(t *testing.T) {
 		if output, err := exec.Command(node, "-e", script, payload).CombinedOutput(); err == nil {
 			t.Fatalf("accepted payload %q with output %q", payload, output)
 		}
+	}
+}
+
+func TestMasterJavaScriptProjectsSparseChangesAndDiscoveryRejectsThem(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
+	data, err := os.ReadFile("template_homeauthmonitorgw.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document templateDocument
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	masterBody := document.Export.Templates[0].Items[0].Preprocessing[0].Parameters[0]
+	run := func(body, input string) ([]byte, error) {
+		script := "const value = process.argv[1]; function transform() {\n" + body + "\n} process.stdout.write(transform());"
+		return exec.Command(node, "-e", script, input).CombinedOutput()
+	}
+	sparse := `{"schema_version":1,"mode":"sparse","generation":"test","cursor":"v1.test.2","captured_at":"2026-10-07T12:00:05Z","sources":[{"name":"source-one","status":{"name":"source-one","driver":"test","available":true,"stale":false,"last_success":"2026-10-07T12:00:05Z","unavailable_since":"0001-01-01T00:00:00Z","poll_duration_ns":1},"metrics":[{"operation":"upsert","identity":"a","metric":{"identity":"a","name":"a","value":3,"value_type":"number","timestamp":"2026-10-07T12:00:05Z"}}]}]}`
+	output, err := run(masterBody, sparse)
+	if err != nil {
+		t.Fatalf("sparse transform: %v: %s", err, output)
+	}
+	var projected map[string]any
+	if err := json.Unmarshal(output, &projected); err != nil {
+		t.Fatal(err)
+	}
+	source := projected["source-one"].(map[string]any)
+	if projected["__poll_mode"] != "sparse" || len(source["metrics"].([]any)) != 1 || projected["__state"] != nil {
+		t.Fatalf("sparse projection=%v", projected)
+	}
+	empty := `{"schema_version":1,"mode":"sparse","generation":"test","cursor":"v1.test.2","captured_at":"2026-10-07T12:00:05Z","sources":[]}`
+	if output, err := run(masterBody, empty); err == nil {
+		t.Fatalf("empty sparse accepted: %s", output)
+	}
+	for _, rule := range document.Export.Templates[0].DiscoveryRules {
+		if output, err := run(rule.Preprocessing[0].Parameters[0], string(output)); err == nil {
+			t.Fatalf("rule %q accepted sparse projection: %s", rule.Key, output)
+		}
+	}
+}
+
+func TestCompositeJavaScriptRejectsSparseWhileOrdinaryMetricUsesOnlyItsChange(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
+	data, err := os.ReadFile("template_homeauthmonitorgw.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document templateDocument
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	items := map[string]string{}
+	for _, item := range document.Export.Templates[0].Items {
+		if len(item.Preprocessing) > 0 && item.Preprocessing[0].Type == "JAVASCRIPT" {
+			items[item.Key] = strings.ReplaceAll(item.Preprocessing[0].Parameters[0], "{$WAGO_SOURCE}", "wago")
+		}
+	}
+	run := func(body, input string) ([]byte, error) {
+		script := "const value = process.argv[1]; function transform() {\n" + body + "\n} process.stdout.write(String(transform()));"
+		return exec.Command(node, "-e", script, input).CombinedOutput()
+	}
+	master := items["automation.gateway.snapshot"]
+	projectVersion := items["automation.gateway.wago.project_version"]
+	softwareInfo := items["automation.gateway.wago.software_info"]
+	if master == "" || projectVersion == "" || softwareInfo == "" {
+		t.Fatalf("missing JavaScript preprocessing: master=%t project=%t composite=%t", master != "", projectVersion != "", softwareInfo != "")
+	}
+	envelope := func(metric string, value any) string {
+		body, err := json.Marshal(map[string]any{
+			"schema_version": 1, "mode": "sparse", "generation": "test", "cursor": "v1.test.2", "captured_at": "2026-10-07T12:00:05Z",
+			"sources": []any{map[string]any{
+				"name": "wago", "status": map[string]any{"name": "wago", "driver": "snmp", "available": true, "stale": false, "last_success": "2026-10-07T12:00:05Z", "unavailable_since": "0001-01-01T00:00:00Z", "poll_duration_ns": 1},
+				"metrics": []any{map[string]any{"operation": "upsert", "identity": metric, "metric": map[string]any{"name": metric, "value": value, "value_type": "string", "timestamp": "2026-10-07T12:00:05Z"}}},
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+	changed, err := run(master, envelope("wioProjectVersion", "2.0"))
+	if err != nil {
+		t.Fatalf("master rejected changed metric: %v: %s", err, changed)
+	}
+	if output, err := run(projectVersion, string(changed)); err != nil || string(output) != "2.0" {
+		t.Fatalf("ordinary changed metric: %v output=%q", err, output)
+	}
+	if output, err := run(softwareInfo, string(changed)); err == nil {
+		t.Fatalf("composite accepted sparse input: %s", output)
+	}
+	unrelated, err := run(master, envelope("unrelated", "value"))
+	if err != nil {
+		t.Fatalf("master rejected unrelated sparse metric: %v: %s", err, unrelated)
+	}
+	if output, err := run(projectVersion, string(unrelated)); err == nil {
+		t.Fatalf("ordinary item accepted unrelated sparse path: %s", output)
 	}
 }
 
@@ -565,8 +741,9 @@ func TestWAGOProjectAndModuleInventory(t *testing.T) {
 	items := map[string]struct {
 		valueType     string
 		preprocessing []struct {
-			Type       string   `yaml:"type"`
-			Parameters []string `yaml:"parameters"`
+			Type         string   `yaml:"type"`
+			ErrorHandler string   `yaml:"error_handler"`
+			Parameters   []string `yaml:"parameters"`
 		}
 		triggers []struct {
 			Name       string `yaml:"name"`
@@ -578,8 +755,9 @@ func TestWAGOProjectAndModuleInventory(t *testing.T) {
 		items[item.Key] = struct {
 			valueType     string
 			preprocessing []struct {
-				Type       string   `yaml:"type"`
-				Parameters []string `yaml:"parameters"`
+				Type         string   `yaml:"type"`
+				ErrorHandler string   `yaml:"error_handler"`
+				Parameters   []string `yaml:"parameters"`
 			}
 			triggers []struct {
 				Name       string `yaml:"name"`
@@ -632,7 +810,7 @@ func TestWAGOProjectAndModuleInventory(t *testing.T) {
 		}
 		body = strings.NewReplacer("{$WAGO_SOURCE}", "wago-750-880-snmp3", "{$WAGO_MODULE_DESCRIPTIONS}", mapping).Replace(body)
 		script := "const value = process.argv[1]; function transform() {\n" + body + "\n} process.stdout.write(String(transform()));"
-		output, err := exec.Command(node, "-e", script, snapshot).CombinedOutput()
+		output, err := exec.Command(node, "-e", script, fullPollProjection(t, snapshot)).CombinedOutput()
 		if err != nil {
 			t.Fatalf("item %q: %v: %s", key, err, output)
 		}
@@ -814,7 +992,7 @@ func TestOverallHealthJavaScriptAggregatesEveryCollector(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			script := "const value = process.argv[1]; function transform() {\n" + scriptBody + "\n} process.stdout.write(String(transform()));"
-			output, err := exec.Command(node, "-e", script, test.snapshot).CombinedOutput()
+			output, err := exec.Command(node, "-e", script, fullPollProjection(t, test.snapshot)).CombinedOutput()
 			if err != nil || string(output) != test.want {
 				t.Fatalf("want=%q error=%v output=%q", test.want, err, output)
 			}
@@ -917,8 +1095,10 @@ func TestDeviceHealthJavaScriptScoresCollectorsIndependently(t *testing.T) {
 		`{"available":true,"stale":false,"last_success":"2026-10-04T00:00:00Z","metrics":[]}`:                            "1",
 		`{"available":false,"stale":true,"last_success":"2026-10-04T00:00:00Z","metrics":[{"name":"metric","value":1}]}`: "2",
 	} {
-		script := "const value = process.argv[1]; function transform() {\n" + genericScript + "\n} process.stdout.write(String(transform()));"
-		output, err := exec.Command(node, "-e", script, source).CombinedOutput()
+		body := strings.ReplaceAll(genericScript, "{#SOURCE}", "generic")
+		script := "const value = process.argv[1]; function transform() {\n" + body + "\n} process.stdout.write(String(transform()));"
+		input := fullPollProjection(t, `{"generic":`+source+`}`)
+		output, err := exec.Command(node, "-e", script, input).CombinedOutput()
 		if err != nil || string(output) != want {
 			t.Fatalf("generic health source=%q want=%q error=%v output=%q", source, want, err, output)
 		}

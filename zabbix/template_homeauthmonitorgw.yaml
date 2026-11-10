@@ -19,7 +19,7 @@ zabbix_export:
           history: '1d'
           trends: '0'
           value_type: TEXT
-          url: '{$AUTOMATION_GATEWAY_URL}/api/v1/metrics/all'
+          url: '{$AUTOMATION_GATEWAY_URL}/api/v1/metrics/poll'
           status_codes: '200'
           follow_redirects: 'NO'
           retrieve_mode: BODY
@@ -32,42 +32,60 @@ zabbix_export:
               value: 'Bearer {$AUTOMATION_GATEWAY_TOKEN}'
           preprocessing:
             - type: JAVASCRIPT
+              error_handler: DISCARD_VALUE
               parameters:
                 - |
                   var response = JSON.parse(value);
-                  if (!response || Array.isArray(response) || typeof response !== 'object' || response.schema_version !== 1 || !Array.isArray(response.sources) || typeof response.cursor !== 'string') {
-                      throw 'snapshot envelope is invalid';
+                  if (!response || Array.isArray(response) || typeof response !== 'object' || response.schema_version !== 1 || (response.mode !== 'full' && response.mode !== 'sparse') || !Array.isArray(response.sources) || typeof response.cursor !== 'string') {
+                      throw 'poll envelope is invalid';
+                  }
+                  if (response.mode === 'sparse' && response.sources.length === 0) {
+                      throw 'empty sparse poll';
+                  }
+                  function indexSources(sources) {
+                      var indexed = {};
+                      sources.forEach(function (source) {
+                          if (!source || typeof source !== 'object' || Array.isArray(source) || typeof source.name !== 'string' || Object.prototype.hasOwnProperty.call(indexed, source.name)) {
+                              throw 'invalid or duplicate source entry';
+                          }
+                          indexed[source.name] = source;
+                      });
+                      return indexed;
                   }
                   var snapshot = {};
-                  response.sources.forEach(function (source) {
-                      if (!source || typeof source !== 'object' || Array.isArray(source) || typeof source.name !== 'string' || Object.prototype.hasOwnProperty.call(snapshot, source.name)) {
-                          throw 'invalid or duplicate source entry';
-                      }
-                      snapshot[source.name] = source;
-                  });
-                  Object.keys(snapshot).forEach(function (sourceName) {
-                      var source = snapshot[sourceName];
+                  if (response.mode === 'full') {
+                      snapshot = indexSources(response.sources);
+                  } else {
+                      response.sources.forEach(function (change) {
+                          if (!change || typeof change !== 'object' || !change.status || !Array.isArray(change.metrics) || typeof change.name !== 'string') throw 'sparse source is invalid';
+                          var source = {};
+                          Object.keys(change.status).forEach(function (key) { source[key] = change.status[key]; });
+                          source.metrics = [];
+                          change.metrics.forEach(function (record) {
+                              if (!record || typeof record.identity !== 'string' || record.operation !== 'upsert' || !record.metric || typeof record.metric !== 'object') throw 'metric record is invalid';
+                              source.metrics.push(record.metric);
+                          });
+                          if (Object.prototype.hasOwnProperty.call(snapshot, change.name)) throw 'duplicate sparse source entry';
+                          snapshot[change.name] = source;
+                      });
+                  }
+                  var validation = snapshot;
+                  Object.keys(validation).forEach(function (sourceName) {
+                      var source = validation[sourceName];
                       if (!/^[A-Za-z0-9._-]{1,64}$/.test(sourceName) || !source || typeof source !== 'object' || Array.isArray(source)) {
                           throw 'invalid source entry';
                       }
                       if (typeof source.driver !== 'string' || typeof source.available !== 'boolean' || typeof source.stale !== 'boolean' || typeof source.last_success !== 'string' || typeof source.unavailable_since !== 'string' || !Array.isArray(source.metrics)) {
                           throw 'invalid source schema';
                       }
-                      if (source.last_success !== '0001-01-01T00:00:00Z' && (isNaN(Date.parse(source.last_success)) || Date.parse(source.last_success) < 0)) {
-                          throw 'invalid source timestamp';
-                      }
-                      if (source.unavailable_since !== '0001-01-01T00:00:00Z' && (isNaN(Date.parse(source.unavailable_since)) || Date.parse(source.unavailable_since) < 0)) {
-                          throw 'invalid unavailable_since timestamp';
-                      }
+                      if (source.last_success !== '0001-01-01T00:00:00Z' && (isNaN(Date.parse(source.last_success)) || Date.parse(source.last_success) < 0)) throw 'invalid source timestamp';
+                      if (source.unavailable_since !== '0001-01-01T00:00:00Z' && (isNaN(Date.parse(source.unavailable_since)) || Date.parse(source.unavailable_since) < 0)) throw 'invalid unavailable_since timestamp';
                       source.metrics.forEach(function (metric) {
-                          if (!metric || typeof metric !== 'object' || Array.isArray(metric) || typeof metric.name !== 'string' || metric.name.length < 1 || metric.name.length > 128 || typeof metric.value_type !== 'string' || typeof metric.timestamp !== 'string' || !Object.prototype.hasOwnProperty.call(metric, 'value')) {
-                              throw 'invalid metric schema';
-                          }
-                          if (isNaN(Date.parse(metric.timestamp)) || Date.parse(metric.timestamp) < 0) {
-                              throw 'invalid metric timestamp';
-                          }
+                          if (!metric || typeof metric !== 'object' || Array.isArray(metric) || typeof metric.name !== 'string' || metric.name.length < 1 || metric.name.length > 128 || typeof metric.value_type !== 'string' || typeof metric.timestamp !== 'string' || !Object.prototype.hasOwnProperty.call(metric, 'value')) throw 'invalid metric schema';
+                          if (isNaN(Date.parse(metric.timestamp)) || Date.parse(metric.timestamp) < 0) throw 'invalid metric timestamp';
                       });
                   });
+                  snapshot.__poll_mode = response.mode;
                   return JSON.stringify(snapshot);
           tags:
             - tag: component
@@ -92,10 +110,13 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JAVASCRIPT
+              error_handler: DISCARD_VALUE
               parameters:
                 - |
-                  var snapshot = JSON.parse(value);
-                  var sourceNames = Object.keys(snapshot);
+                  var payload = JSON.parse(value);
+                  if (payload.__poll_mode !== 'full') throw 'full poll required';
+                  var snapshot = payload;
+                  var sourceNames = Object.keys(snapshot).filter(function (name) { return name !== '__poll_mode' && name !== '__state'; });
                   if (sourceNames.length === 0) return 1;
                   var overall = 0;
                   function worsen(state) {
@@ -176,9 +197,11 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JSONPATH
+              error_handler: DISCARD_VALUE
               parameters:
                 - '$["{$WAGO_SOURCE}"].available'
             - type: JAVASCRIPT
+              error_handler: DISCARD_VALUE
               parameters:
                 - 'return value === "true" ? 1 : 0;'
           tags:
@@ -199,10 +222,17 @@ zabbix_export:
           master_item:
             key: automation.gateway.snapshot
           preprocessing:
-            - type: JSONPATH
-              parameters:
-                - '$["{$WAGO_SOURCE}"]'
             - type: JAVASCRIPT
+              error_handler: DISCARD_VALUE
+              parameters:
+                - |
+                  var payload = JSON.parse(value);
+                  if (payload.__poll_mode !== 'full') throw 'full poll required';
+                  var source = payload['{$WAGO_SOURCE}'];
+                  if (!source) throw 'WAGO source not found';
+                  return JSON.stringify(source);
+            - type: JAVASCRIPT
+              error_handler: DISCARD_VALUE
               parameters:
                 - |
                   var source = JSON.parse(value);
@@ -244,6 +274,7 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JSONPATH
+              error_handler: DISCARD_VALUE
               parameters:
                 - '$["{$WAGO_SOURCE}"].metrics[?(@.labels.oid == "1.3.6.1.2.1.1.3.0")].value.first()'
             - type: MULTIPLIER
@@ -269,6 +300,7 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JSONPATH
+              error_handler: DISCARD_VALUE
               parameters:
                 - '$["{$WAGO_SOURCE}"].metrics[?(@.labels.oid == "1.3.6.1.4.1.13576.10.1.20.4.0")].value.first()'
           tags:
@@ -286,6 +318,7 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JSONPATH
+              error_handler: DISCARD_VALUE
               parameters:
                 - '$["{$WAGO_SOURCE}"].metrics[?(@.labels.oid == "1.3.6.1.4.1.13576.10.1.20.2.0")].value.first()'
           tags:
@@ -305,6 +338,7 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JSONPATH
+              error_handler: DISCARD_VALUE
               parameters:
                 - '$["{$WAGO_SOURCE}"].metrics[?(@.labels.oid == "1.3.6.1.4.1.13576.10.1.11.5.0")].value.first()'
           tags:
@@ -322,6 +356,7 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JSONPATH
+              error_handler: DISCARD_VALUE
               parameters:
                 - '$["{$WAGO_SOURCE}"].metrics[?(@.labels.oid == "1.3.6.1.4.1.13576.10.1.30.9.1.3.1")].value.first()'
           tags:
@@ -340,6 +375,7 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JSONPATH
+              error_handler: DISCARD_VALUE
               parameters:
                 - '$["{$WAGO_SOURCE}"].metrics[?(@.labels.oid == "1.3.6.1.4.1.13576.10.1.30.9.1.9.1")].value.first()'
           tags:
@@ -357,6 +393,7 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JSONPATH
+              error_handler: DISCARD_VALUE
               parameters:
                 - '$["{$WAGO_SOURCE}"].metrics[?(@.labels.oid == "1.3.6.1.4.1.13576.10.1.10.4.0")].value.first()'
           tags:
@@ -374,6 +411,7 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JSONPATH
+              error_handler: DISCARD_VALUE
               parameters:
                 - '$["{$WAGO_SOURCE}"].metrics[?(@.name == "wioProjectId")].value.first()'
           tags:
@@ -393,6 +431,7 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JSONPATH
+              error_handler: DISCARD_VALUE
               parameters:
                 - '$["{$WAGO_SOURCE}"].metrics[?(@.name == "wioProjectName")].value.first()'
           tags:
@@ -412,10 +451,12 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JAVASCRIPT
+              error_handler: DISCARD_VALUE
               parameters:
                 - |
-                  var snapshot = JSON.parse(value);
-                  var source = snapshot['{$WAGO_SOURCE}'];
+                  var payload = JSON.parse(value);
+                  if (payload.__poll_mode !== 'full' && payload.__poll_mode !== 'sparse') throw 'poll mode is invalid';
+                  var source = payload['{$WAGO_SOURCE}'];
                   if (!source || !Array.isArray(source.metrics)) throw 'WAGO source not found';
                   for (var index = 0; index < source.metrics.length; index++) {
                       if (source.metrics[index].name === 'wioProjectVersion') {
@@ -423,6 +464,7 @@ zabbix_export:
                           return version || 'Not set';
                       }
                   }
+                  if (payload.__poll_mode === 'sparse') throw 'metric unchanged';
                   return 'Not reported';
           tags:
             - tag: component
@@ -441,9 +483,12 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JAVASCRIPT
+              error_handler: DISCARD_VALUE
               parameters:
                 - |
-                  var snapshot = JSON.parse(value);
+                  var payload = JSON.parse(value);
+                  if (payload.__poll_mode !== 'full') throw 'full poll required';
+                  var snapshot = payload;
                   var source = snapshot['{$WAGO_SOURCE}'];
                   if (!source || !Array.isArray(source.metrics)) throw 'WAGO source not found';
                   var values = {};
@@ -500,6 +545,7 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JSONPATH
+              error_handler: DISCARD_VALUE
               parameters:
                 - '$["{$WAGO_SOURCE}"].metrics[?(@.name == "wioModulCount")].value.first()'
           tags:
@@ -519,9 +565,12 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JAVASCRIPT
+              error_handler: DISCARD_VALUE
               parameters:
                 - |
-                  var snapshot = JSON.parse(value);
+                  var payload = JSON.parse(value);
+                  if (payload.__poll_mode !== 'full') throw 'full poll required';
+                  var snapshot = payload;
                   var source = snapshot['{$WAGO_SOURCE}'];
                   if (!source || !Array.isArray(source.metrics)) throw 'WAGO source not found';
                   var descriptions = {$WAGO_MODULE_DESCRIPTIONS};
@@ -563,9 +612,12 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JAVASCRIPT
+              error_handler: DISCARD_VALUE
               parameters:
                 - |
-                  var snapshot = JSON.parse(value);
+                  var payload = JSON.parse(value);
+                  if (payload.__poll_mode !== 'full') throw 'full poll required';
+                  var snapshot = payload;
                   var source = snapshot['{$WAGO_SOURCE}'];
                   if (!source || !Array.isArray(source.metrics)) throw 'WAGO source not found';
 
@@ -741,9 +793,12 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JAVASCRIPT
+              error_handler: DISCARD_VALUE
               parameters:
                 - |
-                  var snapshot = JSON.parse(value);
+                  var payload = JSON.parse(value);
+                  if (payload.__poll_mode !== 'full') throw 'full poll required';
+                  var snapshot = payload;
                   var source = snapshot['{$WAGO_SOURCE}'];
                   if (!source || !Array.isArray(source.metrics)) throw 'WAGO source not found';
                   var slots = {};
@@ -783,10 +838,17 @@ zabbix_export:
           master_item:
             key: automation.gateway.snapshot
           preprocessing:
-            - type: JSONPATH
-              parameters:
-                - '$["{$PHOENIX_SOURCE}"]'
             - type: JAVASCRIPT
+              error_handler: DISCARD_VALUE
+              parameters:
+                - |
+                  var payload = JSON.parse(value);
+                  if (payload.__poll_mode !== 'full') throw 'full poll required';
+                  var source = payload['{$PHOENIX_SOURCE}'];
+                  if (!source) throw 'Phoenix source not found';
+                  return JSON.stringify(source);
+            - type: JAVASCRIPT
+              error_handler: DISCARD_VALUE
               parameters:
                 - |
                   var source = JSON.parse(value);
@@ -832,9 +894,11 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JSONPATH
+              error_handler: DISCARD_VALUE
               parameters:
                 - '$["{$PHOENIX_SOURCE}"].metrics[?(@.name == "ups.status")].value.first()'
             - type: JAVASCRIPT
+              error_handler: DISCARD_VALUE
               parameters:
                 - |
                   var meanings = {
@@ -880,6 +944,7 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JSONPATH
+              error_handler: DISCARD_VALUE
               parameters:
                 - '$["{$PHOENIX_SOURCE}"].metrics[?(@.name == "device.model")].value.first()'
           tags:
@@ -897,6 +962,7 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JSONPATH
+              error_handler: DISCARD_VALUE
               parameters:
                 - '$["{$PHOENIX_SOURCE}"].metrics[?(@.name == "battery.charge")].value.first()'
           tags:
@@ -914,6 +980,7 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JSONPATH
+              error_handler: DISCARD_VALUE
               parameters:
                 - '$["{$PHOENIX_SOURCE}"].metrics[?(@.name == "battery.runtime")].value.first()'
           tags:
@@ -931,6 +998,7 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JSONPATH
+              error_handler: DISCARD_VALUE
               parameters:
                 - '$["{$PHOENIX_SOURCE}"].metrics[?(@.name == "battery.temperature")].value.first()'
           tags:
@@ -948,6 +1016,7 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JSONPATH
+              error_handler: DISCARD_VALUE
               parameters:
                 - '$["{$PHOENIX_SOURCE}"].metrics[?(@.name == "output.voltage")].value.first()'
           tags:
@@ -974,9 +1043,11 @@ zabbix_export:
                 key: automation.gateway.snapshot
               preprocessing:
                 - type: JSONPATH
+                  error_handler: DISCARD_VALUE
                   parameters:
                     - '{#SOURCEPATH}.available'
                 - type: JAVASCRIPT
+                  error_handler: DISCARD_VALUE
                   parameters:
                     - 'return value === "true" ? 1 : 0;'
               tags:
@@ -998,9 +1069,11 @@ zabbix_export:
                 key: automation.gateway.snapshot
               preprocessing:
                 - type: JSONPATH
+                  error_handler: DISCARD_VALUE
                   parameters:
                     - '{#SOURCEPATH}.stale'
                 - type: JAVASCRIPT
+                  error_handler: DISCARD_VALUE
                   parameters:
                     - 'return value === "true" ? 1 : 0;'
               tags:
@@ -1023,9 +1096,11 @@ zabbix_export:
                 key: automation.gateway.snapshot
               preprocessing:
                 - type: JSONPATH
+                  error_handler: DISCARD_VALUE
                   parameters:
                     - '{#SOURCEPATH}.unavailable_since'
                 - type: JAVASCRIPT
+                  error_handler: DISCARD_VALUE
                   parameters:
                     - |
                       if (value === '0001-01-01T00:00:00Z') {
@@ -1056,13 +1131,14 @@ zabbix_export:
               master_item:
                 key: automation.gateway.snapshot
               preprocessing:
-                - type: JSONPATH
-                  parameters:
-                    - '{#SOURCEPATH}'
                 - type: JAVASCRIPT
+                  error_handler: DISCARD_VALUE
                   parameters:
                     - |
-                      var source = JSON.parse(value);
+                      var payload = JSON.parse(value);
+                      if (payload.__poll_mode !== 'full') throw 'full poll required';
+                      var source = payload['{#SOURCE}'];
+                      if (!source) throw 'source not found';
                       if (!source.last_success || source.last_success === '0001-01-01T00:00:00Z') return 1;
                       if (!source.available) return 2;
                       if (source.stale || source.metrics.length === 0) return 1;
@@ -1087,9 +1163,11 @@ zabbix_export:
                 key: automation.gateway.snapshot
               preprocessing:
                 - type: JSONPATH
+                  error_handler: DISCARD_VALUE
                   parameters:
                     - '{#SOURCEPATH}.last_success'
                 - type: JAVASCRIPT
+                  error_handler: DISCARD_VALUE
                   parameters:
                     - |
                       if (value === '0001-01-01T00:00:00Z') {
@@ -1142,9 +1220,12 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JAVASCRIPT
+              error_handler: DISCARD_VALUE
               parameters:
                 - |
-                  var snapshot = JSON.parse(value);
+                  var payload = JSON.parse(value);
+                  if (payload.__poll_mode !== 'full') throw 'discovery requires a full poll';
+                  var snapshot = payload;
                   var sources = [];
                   Object.keys(snapshot).sort().forEach(function (name) {
                       var source = snapshot[name];
@@ -1178,6 +1259,7 @@ zabbix_export:
                 key: automation.gateway.snapshot
               preprocessing:
                 - type: JSONPATH
+                  error_handler: DISCARD_VALUE
                   parameters:
                     - '{#VALUE_JSONPATH}'
               tags:
@@ -1195,6 +1277,8 @@ zabbix_export:
               name: 'Source {#SOURCE}: metric {#METRIC} timestamp'
               type: DEPENDENT
               key: 'automation.gateway.metric.timestamp["{#SOURCE}","{#METRIC_KEY}"]'
+              discover: NO
+              status: DISABLED
               history: '7d'
               trends: '30d'
               value_type: UNSIGNED
@@ -1204,9 +1288,11 @@ zabbix_export:
                 key: automation.gateway.snapshot
               preprocessing:
                 - type: JSONPATH
+                  error_handler: DISCARD_VALUE
                   parameters:
                     - '{#TIMESTAMP_JSONPATH}'
                 - type: JAVASCRIPT
+                  error_handler: DISCARD_VALUE
                   parameters:
                     - |
                       var timestamp = Date.parse(value);
@@ -1225,9 +1311,12 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JAVASCRIPT
+              error_handler: DISCARD_VALUE
               parameters:
                 - |
-                  var snapshot = JSON.parse(value);
+                  var payload = JSON.parse(value);
+                  if (payload.__poll_mode !== 'full') throw 'discovery requires a full poll';
+                  var snapshot = payload;
                   var discovered = [];
                   Object.keys(snapshot).sort().forEach(function (sourceName) {
                       var source = snapshot[sourceName];
@@ -1293,6 +1382,7 @@ zabbix_export:
                 key: automation.gateway.snapshot
               preprocessing:
                 - type: JSONPATH
+                  error_handler: DISCARD_VALUE
                   parameters:
                     - '{#VALUE_JSONPATH}'
                 - type: MULTIPLIER
@@ -1313,6 +1403,8 @@ zabbix_export:
               name: 'Source {#SOURCE}: metric {#METRIC} timestamp'
               type: DEPENDENT
               key: 'automation.gateway.metric.numeric.timestamp["{#SOURCE}","{#METRIC_KEY}"]'
+              discover: NO
+              status: DISABLED
               history: '7d'
               trends: '30d'
               value_type: UNSIGNED
@@ -1322,9 +1414,11 @@ zabbix_export:
                 key: automation.gateway.snapshot
               preprocessing:
                 - type: JSONPATH
+                  error_handler: DISCARD_VALUE
                   parameters:
                     - '{#TIMESTAMP_JSONPATH}'
                 - type: JAVASCRIPT
+                  error_handler: DISCARD_VALUE
                   parameters:
                     - |
                       var timestamp = Date.parse(value);
@@ -1343,9 +1437,12 @@ zabbix_export:
             key: automation.gateway.snapshot
           preprocessing:
             - type: JAVASCRIPT
+              error_handler: DISCARD_VALUE
               parameters:
                 - |
-                  var snapshot = JSON.parse(value);
+                  var payload = JSON.parse(value);
+                  if (payload.__poll_mode !== 'full') throw 'discovery requires a full poll';
+                  var snapshot = payload;
                   var discovered = [];
                   Object.keys(snapshot).sort().forEach(function (sourceName) {
                       var source = snapshot[sourceName];
@@ -1404,8 +1501,8 @@ zabbix_export:
           type: SECRET_TEXT
           description: 'Bearer token authorized by the gateway. Set at the narrowest appropriate host or template scope.'
         - macro: '{$AUTOMATION_GATEWAY_INTERVAL}'
-          value: '30s'
-          description: 'Master item interval; do not set below the useful collector interval.'
+          value: '5s'
+          description: 'Native latest-state poll interval.'
         - macro: '{$AUTOMATION_GATEWAY_TIMEOUT}'
           value: '10s'
           description: 'HTTPS timeout, shorter than the master item interval.'

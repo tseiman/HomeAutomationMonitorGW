@@ -15,8 +15,10 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/cache"
@@ -28,6 +30,7 @@ type Options struct {
 	Version           string
 	Logger            *slog.Logger
 	HeartbeatInterval time.Duration
+	Now               func() time.Time
 }
 
 // View is one coherent cache and authorization-policy generation.
@@ -37,6 +40,7 @@ type View struct {
 	TokenDigests        [][sha256.Size]byte
 	AllowedClients      []netip.Prefix
 	CertificateNotAfter time.Time
+	PollFullInterval    time.Duration
 }
 
 // ViewProvider returns the current coherent runtime generation for one request.
@@ -46,6 +50,32 @@ type ViewProvider func() View
 type API struct {
 	view    ViewProvider
 	options Options
+	pollMu  sync.Mutex
+	polls   map[[sha256.Size]byte]*pollState
+}
+
+type pollState struct {
+	mu          sync.Mutex
+	initialized bool
+	generation  string
+	cursor      string
+	lastFull    time.Time
+}
+
+type pollEnvelope struct {
+	SchemaVersion int       `json:"schema_version"`
+	Mode          string    `json:"mode"`
+	Reason        string    `json:"reason,omitempty"`
+	Generation    string    `json:"generation"`
+	Cursor        string    `json:"cursor"`
+	CapturedAt    time.Time `json:"captured_at"`
+	Sources       any       `json:"sources"`
+}
+
+type sparseSource struct {
+	Name    string               `json:"name"`
+	Status  cache.SourceStatus   `json:"status"`
+	Metrics []cache.MetricRecord `json:"metrics"`
 }
 
 // New returns a cache-only HTTP handler that obtains one current runtime generation per request.
@@ -53,7 +83,10 @@ func New(view ViewProvider, options Options) http.Handler {
 	if options.HeartbeatInterval <= 0 {
 		options.HeartbeatInterval = 15 * time.Second
 	}
-	api := &API{view: view, options: options}
+	if options.Now == nil {
+		options.Now = time.Now
+	}
+	api := &API{view: view, options: options, polls: make(map[[sha256.Size]byte]*pollState)}
 	handler := http.Handler(http.HandlerFunc(api.serve))
 	if options.Logger != nil {
 		handler = accessLogger(options.Logger, handler)
@@ -115,7 +148,8 @@ func (a *API) serve(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden")
 		return
 	}
-	if !validBearer(r.Header.Values("Authorization"), view.TokenDigests) {
+	tokenDigest, authenticated := bearerIdentity(r.Header.Values("Authorization"), view.TokenDigests)
+	if !authenticated {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="automation-gateway"`)
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
@@ -142,6 +176,9 @@ func (a *API) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	case "/api/v1/metrics/delta":
 		a.deltaMetrics(w, r, view.Store)
+		return
+	case "/api/v1/metrics/poll":
+		a.pollMetrics(w, view, tokenDigest)
 		return
 	case "/api/v1/status":
 		a.status(w, view.Status)
@@ -191,25 +228,32 @@ func clientAllowed(remoteAddress string, allowed []netip.Prefix) bool {
 
 // validBearer requires one header with a Bearer scheme, ASCII-space separator, and one matching precomputed digest.
 func validBearer(headers []string, expected [][sha256.Size]byte) bool {
+	_, valid := bearerIdentity(headers, expected)
+	return valid
+}
+
+// bearerIdentity authenticates one bearer and returns only its stable SHA-256 identity.
+func bearerIdentity(headers []string, expected [][sha256.Size]byte) ([sha256.Size]byte, bool) {
+	var zero [sha256.Size]byte
 	if len(headers) != 1 || len(expected) == 0 {
-		return false
+		return zero, false
 	}
 	header := headers[0]
 	separator := strings.IndexByte(header, ' ')
 	if separator <= 0 || !strings.EqualFold(header[:separator], "Bearer") {
-		return false
+		return zero, false
 	}
 	credentialStart := separator
 	for credentialStart < len(header) && header[credentialStart] == ' ' {
 		credentialStart++
 	}
 	if credentialStart == len(header) {
-		return false
+		return zero, false
 	}
 	candidate := header[credentialStart:]
 	for _, r := range candidate {
 		if r < 0x21 || r == 0x7f || r == ',' {
-			return false
+			return zero, false
 		}
 	}
 	candidateDigest := sha256.Sum256([]byte(candidate))
@@ -218,7 +262,7 @@ func validBearer(headers []string, expected [][sha256.Size]byte) bool {
 	for _, tokenDigest := range expected {
 		matched |= subtle.ConstantTimeCompare(candidateDigest[:], tokenDigest[:])
 	}
-	return matched == 1
+	return candidateDigest, matched == 1
 }
 
 // health writes gateway status derived from the selected generation's source snapshots.
@@ -319,6 +363,130 @@ func (a *API) deltaMetrics(w http.ResponseWriter, r *http.Request, store *cache.
 	default:
 		writeError(w, http.StatusInternalServerError, "delta unavailable")
 	}
+}
+
+// pollMetrics advances one authenticated reader's in-memory cursor and returns a full snapshot or collapsed latest-state delta.
+func (a *API) pollMetrics(w http.ResponseWriter, view View, identity [sha256.Size]byte) {
+	state := a.pollState(identity, view.TokenDigests)
+	state.mu.Lock()
+	now := a.options.Now().UTC()
+	interval := view.PollFullInterval
+	if interval <= 0 {
+		interval = 10 * time.Minute
+	}
+	if !state.initialized {
+		response := buildPollFull(view.Store, state, "first_request", now)
+		state.mu.Unlock()
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	if now.Sub(state.lastFull) >= interval {
+		response := buildPollFull(view.Store, state, "periodic", now)
+		state.mu.Unlock()
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+
+	latest := make(map[string]*sparseSource)
+	cursor := state.cursor
+	for {
+		delta, err := view.Store.Delta(cursor)
+		if err != nil {
+			if errors.Is(err, cache.ErrCursorGeneration) || errors.Is(err, cache.ErrCursorExpired) || errors.Is(err, cache.ErrCursorFuture) {
+				response := buildPollFull(view.Store, state, "reset_required", now)
+				state.mu.Unlock()
+				writeJSON(w, http.StatusOK, response)
+				return
+			}
+			state.mu.Unlock()
+			writeError(w, http.StatusInternalServerError, "poll delta unavailable")
+			return
+		}
+		for _, transaction := range delta.Transactions {
+			if transaction.DiscoveryChanged {
+				response := buildPollFull(view.Store, state, "discovery_changed", now)
+				state.mu.Unlock()
+				writeJSON(w, http.StatusOK, response)
+				return
+			}
+			for _, record := range transaction.Metrics {
+				if record.Operation == "remove" {
+					response := buildPollFull(view.Store, state, "metric_removed", now)
+					state.mu.Unlock()
+					writeJSON(w, http.StatusOK, response)
+					return
+				}
+			}
+			source := latest[transaction.Source]
+			if source == nil {
+				source = &sparseSource{Name: transaction.Source, Metrics: []cache.MetricRecord{}}
+				latest[transaction.Source] = source
+			}
+			source.Status = transaction.Status
+			byIdentity := make(map[string]cache.MetricRecord, len(source.Metrics)+len(transaction.Metrics))
+			for _, record := range source.Metrics {
+				byIdentity[record.Identity] = record
+			}
+			for _, record := range transaction.Metrics {
+				byIdentity[record.Identity] = record
+			}
+			keys := make([]string, 0, len(byIdentity))
+			for key := range byIdentity {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			source.Metrics = source.Metrics[:0]
+			for _, key := range keys {
+				source.Metrics = append(source.Metrics, byIdentity[key])
+			}
+		}
+		cursor = delta.NextCursor
+		if !delta.HasMore {
+			break
+		}
+	}
+	names := make([]string, 0, len(latest))
+	for name := range latest {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	sources := make([]sparseSource, 0, len(names))
+	for _, name := range names {
+		sources = append(sources, *latest[name])
+	}
+	state.cursor = cursor
+	response := pollEnvelope{SchemaVersion: 1, Mode: "sparse", Generation: state.generation, Cursor: cursor, CapturedAt: now, Sources: sources}
+	state.mu.Unlock()
+	writeJSON(w, http.StatusOK, response)
+}
+
+func buildPollFull(store *cache.Store, state *pollState, reason string, now time.Time) pollEnvelope {
+	full := store.Full()
+	state.initialized = true
+	state.generation = full.Generation
+	state.cursor = full.Cursor
+	state.lastFull = now
+	return pollEnvelope{SchemaVersion: 1, Mode: "full", Reason: reason, Generation: full.Generation, Cursor: full.Cursor, CapturedAt: full.CapturedAt, Sources: full.Sources}
+}
+
+func (a *API) pollState(identity [sha256.Size]byte, configured [][sha256.Size]byte) *pollState {
+	a.pollMu.Lock()
+	defer a.pollMu.Unlock()
+	allowed := make(map[[sha256.Size]byte]struct{}, len(configured))
+	for _, digest := range configured {
+		allowed[digest] = struct{}{}
+	}
+	for digest := range a.polls {
+		if _, ok := allowed[digest]; !ok {
+			delete(a.polls, digest)
+		}
+	}
+	state := a.polls[identity]
+	if state == nil {
+		state = &pollState{}
+		a.polls[identity] = state
+	}
+	return state
 }
 
 // status writes the current canonical gateway and collector activity snapshot.

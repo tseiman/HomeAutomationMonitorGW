@@ -196,7 +196,7 @@ func serve(configPaths []string, logOutput io.Writer, foreground bool, levelOver
 	cfg := runtime.Config()
 	handler := httpapi.New(func() httpapi.View {
 		view := runtime.View()
-		return httpapi.View{Store: view.Store, Status: view.Status, TokenDigests: view.TokenDigests, AllowedClients: view.AllowedClients, CertificateNotAfter: view.CertificateNotAfter}
+		return httpapi.View{Store: view.Store, Status: view.Status, TokenDigests: view.TokenDigests, AllowedClients: view.AllowedClients, CertificateNotAfter: view.CertificateNotAfter, PollFullInterval: view.PollFullInterval}
 	}, httpapi.Options{Version: version, Logger: logger})
 	server := &http.Server{Addr: cfg.Server.Listen, Handler: handler, ReadHeaderTimeout: cfg.Server.ReadTimeout.Duration, ReadTimeout: cfg.Server.ReadTimeout.Duration, WriteTimeout: cfg.Server.WriteTimeout.Duration, IdleTimeout: cfg.Server.IdleTimeout.Duration, MaxHeaderBytes: cfg.Server.MaxHeaderBytes, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: runtime.GetCertificate}}
 	errs := make(chan error, 1)

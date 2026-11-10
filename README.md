@@ -25,14 +25,16 @@ For an archive release, verify its adjacent checksum before extraction, then run
 
 ## Configure
 
-Start from [`configs/config.example.yaml`](configs/config.example.yaml). It documents HTTPS, authentication, delta-journal limits, logging, and sources. Unknown YAML fields are rejected. There is no Zabbix configuration section: the gateway needs no Zabbix URL, credential, CA override, cursor file, or integration state.
+Start from [`configs/config.example.yaml`](configs/config.example.yaml). It documents HTTPS, authentication, delta-journal limits, logging, and sources. Unknown YAML fields are rejected. There is no Zabbix configuration section: the gateway needs no Zabbix URL, credential, CA override, cursor file, or persistent integration state; `/metrics/poll` keeps only bounded per-token progress in memory.
 
 Every API client needs both:
 
 - its actual TCP source address or canonical CIDR in `authentication.allowed_clients`;
 - a protected token file in `authentication.bearer_token_files`.
 
-For Zabbix, allow the server or proxy address. Import [`zabbix/template_homeauthmonitorgw.yaml`](zabbix/template_homeauthmonitorgw.yaml), set its gateway URL, secret token, interval, and timeout macros, and keep certificate peer and hostname verification enabled. The HTTP-agent master fetches `/api/v1/metrics/all`; dependent items, discovery, triggers, and dashboards consume its validated source-keyed projection. Package installation never imports the template or changes Zabbix.
+Assign one distinct token to each logical polling reader. The token digest identifies that reader's in-memory poll cursor; raw tokens are never returned or logged.
+
+For Zabbix, allow the server or proxy address. Import [`zabbix/template_homeauthmonitorgw.yaml`](zabbix/template_homeauthmonitorgw.yaml), set its gateway URL and dedicated secret token, and keep certificate peer and hostname verification enabled. One native HTTP-agent master polls `/api/v1/metrics/poll` every 5 seconds. It receives a full snapshot initially and at least every `delta.poll_full_interval` (default 10 minutes), with latest-state sparse changes between full responses. Package installation never imports the template or changes Zabbix.
 
 ## Validate and operate
 
@@ -51,6 +53,7 @@ All API routes enforce TLS, the client-address allowlist, and bearer authenticat
 - `GET /api/v1/metrics` retains the established source-keyed response.
 - `GET /api/v1/metrics/all` returns an atomic complete `sources` snapshot and matching opaque `cursor`.
 - `GET /api/v1/metrics/delta?since=<cursor>` replays whole transactions without consuming them globally.
+- `GET /api/v1/metrics/poll` provides token-identified full/latest-state sparse polling for native HTTP clients.
 - `GET /api/v1/status` and `/api/v1/status/events` expose runtime status.
 
 A cursor-capable client owns its cursor:
@@ -61,7 +64,7 @@ A cursor-capable client owns its cursor:
 4. continue immediately while `has_more` is true;
 5. poll later from the last applied cursor.
 
-Retry a failed or ambiguous request with the same cursor. Multiple readers may bootstrap at different cursors and replay independently. On `410 Gone`, or `409 Conflict` with `reset_required: true`, discard incremental state and take a new full snapshot. The shipped Zabbix template intentionally uses full HTTP-agent snapshots; it does not claim that a native HTTP item retains the opaque cursor.
+Retry a failed or ambiguous generic delta request with the same cursor. Multiple readers may bootstrap at different cursors and replay independently. On `410 Gone`, or `409 Conflict` with `reset_required: true`, discard incremental state and take a new full snapshot. Native `/metrics/poll` has no acknowledgement: intermediate changes may collapse to the latest value, and uncertain delivery is repaired by the next periodic full response. It is not a lossless history transport and does not preserve every original history timestamp.
 
 ## Update
 

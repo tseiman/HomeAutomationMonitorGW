@@ -60,12 +60,13 @@ type Config struct {
 
 // Delta bounds the in-memory change journal and unchanged-value heartbeats.
 type Delta struct {
-	Heartbeat    Duration `yaml:"heartbeat"`
-	RetentionAge Duration `yaml:"retention_age"`
-	MaxEvents    int      `yaml:"max_events"`
-	MaxBytes     int64    `yaml:"max_bytes"`
-	maxEventsSet bool
-	maxBytesSet  bool
+	Heartbeat        Duration `yaml:"heartbeat"`
+	RetentionAge     Duration `yaml:"retention_age"`
+	PollFullInterval Duration `yaml:"poll_full_interval"`
+	MaxEvents        int      `yaml:"max_events"`
+	MaxBytes         int64    `yaml:"max_bytes"`
+	maxEventsSet     bool
+	maxBytesSet      bool
 }
 
 // UnmarshalYAML retains explicit zero limits so they are rejected rather than defaulted.
@@ -78,7 +79,7 @@ func (d *Delta) UnmarshalYAML(node *yaml.Node) error {
 	*d = Delta(decoded)
 	for index := 0; index+1 < len(node.Content); index += 2 {
 		switch node.Content[index].Value {
-		case "heartbeat", "retention_age":
+		case "heartbeat", "retention_age", "poll_full_interval":
 		case "max_events":
 			d.maxEventsSet = true
 		case "max_bytes":
@@ -555,6 +556,9 @@ func (c *Config) defaults() {
 	if !c.Delta.RetentionAge.set {
 		c.Delta.RetentionAge.Duration = 30 * time.Minute
 	}
+	if !c.Delta.PollFullInterval.set {
+		c.Delta.PollFullInterval.Duration = 10 * time.Minute
+	}
 	if !c.Delta.maxEventsSet {
 		c.Delta.MaxEvents = 10000
 	}
@@ -650,6 +654,9 @@ func (c Config) Validate() error {
 	}
 	if c.Delta.RetentionAge.Duration < time.Minute || c.Delta.RetentionAge.Duration > 24*time.Hour {
 		return errors.New("delta.retention_age must be between 1m and 24h")
+	}
+	if c.Delta.PollFullInterval.Duration < time.Minute || c.Delta.PollFullInterval.Duration > 24*time.Hour {
+		return errors.New("delta.poll_full_interval must be between 1m and 24h")
 	}
 	if c.Delta.MaxEvents < 1 || c.Delta.MaxEvents > 1000000 {
 		return errors.New("delta.max_events must be between 1 and 1000000")

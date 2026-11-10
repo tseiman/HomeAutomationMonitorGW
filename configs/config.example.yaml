@@ -25,6 +25,7 @@ authentication:
 delta:
   heartbeat: "5m"          # unchanged metrics are repeated at this interval (5s-24h)
   retention_age: "30m"     # replay age window (1m-24h)
+  poll_full_interval: "10m" # periodic full resync for token-identified pollers (1m-24h)
   max_events: 10000        # whole poll transactions (1-1000000)
   max_bytes: 67108864      # approximate encoded journal bytes (1KiB-1GiB)
 

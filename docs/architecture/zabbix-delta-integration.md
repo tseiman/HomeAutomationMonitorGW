@@ -31,8 +31,22 @@ A failed or ambiguous request is retried with the same cursor. Reads do not cons
 
 An expired cursor returns `410 Gone`. A cursor from a different process or reload generation returns `409 Conflict` with `reset_required: true`. A future cursor returns `409 Conflict`; malformed input returns `400 Bad Request`. Expired and wrong-generation readers discard incremental state and bootstrap again from `/api/v1/metrics/all`.
 
+## Token-identified native polling
+
+`GET /api/v1/metrics/poll` is the stateful adapter for an ordinary native HTTP poller that cannot retain an opaque cursor. Authentication still uses the existing bearer-token list. After constant-time authentication, only the token's SHA-256 digest identifies the reader; the raw token is never returned or logged. Assign one distinct token per logical poll reader. State is concurrency-safe, bounded to the currently configured token digests, memory-only, and removed when a token leaves the active policy.
+
+The first request, a new token, process start, successful reload/cache-generation mismatch, expired cursor, discovery change, metric removal, or `delta.poll_full_interval` (default `10m`) returns a full response. A metric removal uses reason `metric_removed`, allowing full-only discovery and composite items to reconcile the current inventory safely.
+
+```json
+{"schema_version":1,"mode":"full","reason":"first_request","generation":"…","cursor":"…","captured_at":"…","sources":[...]}
+```
+
+Other requests return `mode: "sparse"`. `sources` contains the latest status and a latest-record-per-metric array of upserts for changed sources; it never contains a hidden full-state copy. Missing sources or metrics mean unchanged, never removed. Intermediate changes between HTTP polls intentionally collapse to the latest record.
+
+The cursor is advanced when the gateway generates a response because native HTTP has no application acknowledgement. Therefore this endpoint provides eventual/latest-state delivery, not lossless intermediate history or original per-change history timestamps. A response lost after generation can create uncertainty until the periodic full response resynchronizes current state.
+
 ## Zabbix template
 
-The shipped Zabbix 7.4 template uses one authenticated HTTPS HTTP-agent master item. It fetches `/api/v1/metrics/all`, verifies the certificate peer and hostname, and transforms the versioned `sources` array to the historical source-keyed object used by dependent items and discovery rules. Its bearer value is a Zabbix `SECRET_TEXT` macro sent in the HTTP header. The gateway allowlist must include the actual Zabbix server or proxy source address.
+The shipped Zabbix 7.4 template uses one authenticated HTTPS HTTP-agent master item at the default `5s` interval. It fetches `/api/v1/metrics/poll`, verifies the certificate peer and hostname, and projects full or sparse envelopes for existing dependent items. Empty sparse responses are discarded at the master. Missing sparse metric paths use `DISCARD_VALUE`, so they do not become zero, unsupported, or deleted. Ordinary metric and source-status dependents consume matching sparse paths. Composite and full-state-derived preprocessing, including discovery, accepts only full responses and discards sparse input. Per-metric timestamp prototypes remain `discover: NO` and `status: DISABLED`.
 
-Native Zabbix HTTP items do not retain the gateway's opaque replay cursor in this template. Periodic full snapshots preserve the existing dependent-item, discovery, and dashboard behavior; the delta endpoint remains available to pull clients that implement cursor ownership explicitly.
+The legacy `/metrics`, `/metrics/all`, and `/metrics/delta` routes remain stateless and unchanged. Cursor-capable clients should continue using full plus generic delta replay when they need ordered retained transactions.

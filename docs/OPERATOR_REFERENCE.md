@@ -454,6 +454,7 @@ Start with [`configs/config.example.yaml`](../configs/config.example.yaml). Impo
 - `authentication.allowed_clients`: exact client IPs or canonical CIDRs; forwarding headers are ignored.
 - `delta.heartbeat`: repeat unchanged metric records after this interval; default `5m`, range `5s`–`24h`.
 - `delta.retention_age`: maximum replay age; default `30m`, range `1m`–`24h`.
+- `delta.poll_full_interval`: periodic full resynchronization for token-identified native pollers; default `10m`, range `1m`–`24h`.
 - `delta.max_events`: maximum retained whole poll transactions; default `10000`, range `1`–`1000000`.
 - `delta.max_bytes`: approximate encoded journal budget; default `67108864` (64 MiB), range 1 KiB–1 GiB. A newest transaction larger than the budget remains replayable rather than being silently lost.
 - `sources[].driver`: `nut`, `snmp`, or `modbus_rtu`.
@@ -656,6 +657,7 @@ Every endpoint requires both an allowed TCP peer and a bearer token:
 - `GET /api/v1/metrics`
 - `GET /api/v1/metrics/all`
 - `GET /api/v1/metrics/delta?since=<cursor>`
+- `GET /api/v1/metrics/poll`
 - `GET /api/v1/status`
 - `GET /api/v1/status/events`
 
@@ -755,7 +757,7 @@ curl --fail --no-buffer \
 
 The optional single-LED client displays `healthy idle = green`, `activity = yellow`, `health error/degraded = red`, and `not reachable = off`. Health errors override simultaneous activity. Multiple LEDs can display health and activity independently.
 
-Import [`zabbix/template_homeauthmonitorgw.yaml`](../zabbix/template_homeauthmonitorgw.yaml), set `{$AUTOMATION_GATEWAY_URL}`, secret `{$AUTOMATION_GATEWAY_TOKEN}`, `{$AUTOMATION_GATEWAY_INTERVAL}`, and `{$AUTOMATION_GATEWAY_TIMEOUT}`, and keep certificate verification enabled. Add the Zabbix server/proxy's actual TCP source address to `authentication.allowed_clients`. The template uses one HTTP-agent master item to fetch `/api/v1/metrics/all`; its preprocessing converts the atomic `sources` array to the legacy source-keyed object used by dependent discovery/items. The gateway has no Zabbix API credential, integration state, or outbound connection. Native Zabbix HTTP items do not retain the opaque delta cursor in this template; cursor-capable clients use the generic delta loop described above.
+Import [`zabbix/template_homeauthmonitorgw.yaml`](../zabbix/template_homeauthmonitorgw.yaml), set `{$AUTOMATION_GATEWAY_URL}`, secret `{$AUTOMATION_GATEWAY_TOKEN}`, `{$AUTOMATION_GATEWAY_INTERVAL}`, and `{$AUTOMATION_GATEWAY_TIMEOUT}`, and keep certificate verification enabled. Add the Zabbix server/proxy's actual TCP source address to `authentication.allowed_clients`. The template uses one HTTP-agent master item to fetch `/api/v1/metrics/poll` every 5 seconds with a dedicated bearer token. The token digest is the bounded, in-memory reader identity. First use, restart/reload generation changes, cursor expiry, discovery changes, metric removal, and the configured 10-minute interval produce a full response; removals use reason `metric_removed`. Other responses contain only changed source status and latest metric upserts, with no full-state copy. Sparse missing values mean unchanged and are discarded rather than stored as zero, unsupported, or removed. Empty sparse responses are discarded at the master; composite/full-state-derived items and discovery run only on full responses. Use one distinct token per logical reader. Native HTTP has no acknowledgement, so this is eventual latest-state delivery: intermediate values can collapse, ambiguous delivery is not replayed losslessly, and periodic full responses repair uncertain state. The generic `/metrics/all` and `/metrics/delta` contracts remain stateless and unchanged. The gateway has no Zabbix API credential, persistent poll state, or outbound connection.
 
 The template stores strings as text and numeric metrics as trendable numeric items. SNMP TimeTicks are converted from centiseconds to seconds; `sysUpTime` uses Zabbix's `uptime` unit for a human-readable duration. The WAGO RTC value map displays `0` as `OK` and `1` as `Battery empty` without changing the numeric value used for alerting.
 

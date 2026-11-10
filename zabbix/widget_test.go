@@ -48,7 +48,7 @@ func runKbusLayoutPreprocessing(t *testing.T, snapshot []byte) map[string]any {
 	}
 	scriptBody = strings.ReplaceAll(scriptBody, "{$WAGO_SOURCE}", "wago-test")
 	script := "const value = process.argv[1]; function transform() {\n" + scriptBody + "\n} process.stdout.write(String(transform()));"
-	output, err := exec.Command(node, "-e", script, string(snapshot)).CombinedOutput()
+	output, err := exec.Command(node, "-e", script, fullPollProjection(t, string(snapshot))).CombinedOutput()
 	if err != nil {
 		t.Fatalf("kbus_layout JS: %v: %s", err, output)
 	}
@@ -216,7 +216,7 @@ func TestKbusLayoutJavaScript(t *testing.T) {
 		`]}}`
 
 	script := "const value = process.argv[1]; function transform() {\n" + scriptBody + "\n} process.stdout.write(String(transform()));"
-	output, err := exec.Command(node, "-e", script, snapshot).CombinedOutput()
+	output, err := exec.Command(node, "-e", script, fullPollProjection(t, snapshot)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("kbus_layout JS: %v: %s", err, output)
 	}
@@ -408,7 +408,7 @@ func TestKbusLayout19SlotsWithProcessImage(t *testing.T) {
 		strings.Join(parts, ",") + `]}}`
 
 	script := "const value = process.argv[1]; function transform() {\n" + scriptBody + "\n} process.stdout.write(String(transform()));"
-	output, err := exec.Command(node, "-e", script, snapshot).CombinedOutput()
+	output, err := exec.Command(node, "-e", script, fullPollProjection(t, snapshot)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("19-slot JS: %v: %s", err, output)
 	}
@@ -498,7 +498,7 @@ func TestKbusLayoutInventoryValidation(t *testing.T) {
 	run := func(snapshot string) map[string]any {
 		t.Helper()
 		script := "const value = process.argv[1]; function transform() {\n" + scriptBody + "\n} process.stdout.write(String(transform()));"
-		output, err := exec.Command(node, "-e", script, snapshot).CombinedOutput()
+		output, err := exec.Command(node, "-e", script, fullPollProjection(t, snapshot)).CombinedOutput()
 		if err != nil {
 			t.Fatalf("JS: %v: %s", err, output)
 		}
@@ -575,7 +575,7 @@ func TestKbusLayoutMissingWioArticleName(t *testing.T) {
 	scriptBody = strings.ReplaceAll(scriptBody, "{$WAGO_SOURCE}", "wago-test")
 	snapshot := `{"wago-test":{"driver":"snmp","available":true,"stale":false,"last_success":"2026-10-05T00:00:00Z","metrics":[{"name":"wioModuleNumber[1]","value":1},{"name":"wioModuleName[1]","value":"750-4xx"},{"name":"wioModuleType[1]","value":1}]}}`
 	script := "const value = process.argv[1]; function transform() {\n" + scriptBody + "\n} process.stdout.write(String(transform()));"
-	output, err := exec.Command(node, "-e", script, snapshot).CombinedOutput()
+	output, err := exec.Command(node, "-e", script, fullPollProjection(t, snapshot)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("JS: %v: %s", err, output)
 	}
@@ -882,7 +882,7 @@ func TestGlobalDiagnosticNoSlotFault(t *testing.T) {
 		`]}}`
 
 	script := "const value = process.argv[1]; function transform() {\n" + scriptBody + "\n} process.stdout.write(String(transform()));"
-	output, err := exec.Command(node, "-e", script, snapshot).CombinedOutput()
+	output, err := exec.Command(node, "-e", script, fullPollProjection(t, snapshot)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("kbus_layout JS: %v: %s", err, output)
 	}

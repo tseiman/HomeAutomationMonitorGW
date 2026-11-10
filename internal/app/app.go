@@ -88,6 +88,7 @@ type RuntimeView struct {
 	TokenDigests        [][sha256.Size]byte
 	AllowedClients      []netip.Prefix
 	CertificateNotAfter time.Time
+	PollFullInterval    time.Duration
 }
 
 // Runtime owns the active generation and collector workers.
@@ -437,6 +438,7 @@ func (r *Runtime) View() RuntimeView {
 		Store: active.store, Status: active.status, TokenDigests: append([][sha256.Size]byte(nil), active.tokenDigests...),
 		AllowedClients:      append([]netip.Prefix(nil), active.allowedClients...),
 		CertificateNotAfter: active.cert.Leaf.NotAfter,
+		PollFullInterval:    active.cfg.Delta.PollFullInterval.Duration,
 	}
 }
 
