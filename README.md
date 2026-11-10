@@ -17,6 +17,8 @@ HomeAutomationMonitorGW is a small, read-only Linux monitoring gateway. It polls
 - [Build and installation](#build-and-installation)
   - [TLS and token permissions](#tls-and-token-permissions)
 - [Cross-build, packaging, transfer, and installation](#cross-build-packaging-transfer-and-installation)
+  - [Install and update from the signed APT repository](#install-and-update-from-the-signed-apt-repository)
+  - [Configure APT signing and GitHub Pages](#configure-apt-signing-and-github-pages)
 - [Optional RevPi status LED client](#optional-revpi-status-led-client)
 - [Configuration](#configuration)
   - [NUT](#nut)
@@ -341,7 +343,7 @@ rm -rf "$INSTALL_DIR"
 rm -f "/tmp/$ARCHIVE" "/tmp/${ARCHIVE}.sha256"
 ```
 
-### 6. Create GitHub release and Debian packages from a version tag
+### 6. Create GitHub releases, Debian packages, and the APT repository
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) runs only when a version tag matching `v[0-9]*` is pushed. Ordinary commits and branch pushes do **not** build or publish releases.
 
@@ -358,27 +360,121 @@ GitHub Actions then:
 
 1. checks out the tagged commit with full tag history;
 2. runs all Go tests and `go vet`, selected race-enabled tests, and explicit CGO-disabled ARMv7/ARM64 gateway cross-build checks;
-3. builds `amd64`, `arm64`, `armv7`/Debian `armhf`, and `386`/Debian `i386` in parallel;
-4. runs `package_release.sh <architecture> --deb` for each architecture;
-5. creates or updates the GitHub Release named after the tag;
-6. uploads raw binaries, checksums, minimal `tar.gz` archives, optional Windows ZIPs if supported in the future, `.deb` packages, and one top-level copy each of `LICENSE` and `THIRD_PARTY_LICENSES.md`.
+3. builds `amd64`, `arm64`, `armv7`/Debian `armhf`, and `386`/Debian `i386` packages;
+4. creates the GitHub Release and uploads binaries, archives, `.deb` files, checksums, and licenses;
+5. builds Debian `Packages` and `Release` indexes from the `.deb` files;
+6. verifies that the configured private signing key matches the repository's pinned public fingerprint;
+7. creates `Release.gpg` and `InRelease`, verifies both signatures, and publishes the repository through GitHub Pages.
 
-Because the build runs at the exact tag, `automation-gateway --version` contains that tag instead of the normal short hash. The workflow uses GitHub's scoped `GITHUB_TOKEN` with explicit `contents: write`; no personal access token is required.
+Stable tags become Debian versions without the leading `v`: tag `v1.2.3` produces package version `1.2.3`. Both `automation-gateway` and `automation-gateway-led` receive the same version, so APT selects a later release such as `1.2.4` as an update. Untagged local packages use a lower development form beginning with `0.0.0+git` and are not published by the tagged workflow.
 
-To install a downloaded Debian package, first verify its adjacent checksum and then use APT so dependencies are resolved:
+The Debian packages install binaries below `/usr/sbin`, matching systemd units below `/lib/systemd/system`, examples below `/usr/share`, and site configuration below `/etc`. Package installation and upgrades preserve existing configuration, token, secret, TLS, and LED-client files. Maintainer scripts intentionally do not enable, start, or restart either service.
+
+Choose either the archive installer or Debian packages for a host; do not mix the two installation methods because their binary and unit locations intentionally differ.
+
+### Install and update from the signed APT repository
+
+The signed repository is published at `https://tseiman.github.io/HomeAutomationMonitorGW/apt`. GitHub Releases alone are downloadable files, not an APT source; the workflow therefore publishes the required signed repository indexes through GitHub Pages.
+
+On the RevPi, install the repository key only after checking its complete fingerprint:
 
 ```bash
-sha256sum -c automation-gateway_1.2.3_arm64.deb.sha256
-sudo apt install ./automation-gateway_1.2.3_arm64.deb
+sudo apt update
+sudo apt install --yes ca-certificates curl gnupg
+sudo install -d -m 0755 /etc/apt/keyrings
+
+curl --fail --silent --show-error --location \
+  https://tseiman.github.io/HomeAutomationMonitorGW/apt/repository-key.asc \
+  --output /tmp/homeautomationmonitorgw-archive-key.asc
+
+KEY_FINGERPRINT="$(gpg --batch --show-keys --with-colons \
+  /tmp/homeautomationmonitorgw-archive-key.asc | \
+  awk -F: '$1 == "fpr" { print $10; exit }')"
+test "$KEY_FINGERPRINT" = "FBB4E68DABB4A25F6E73C81DD4EA266E8BC8043F"
+
+gpg --batch --dearmor \
+  < /tmp/homeautomationmonitorgw-archive-key.asc | \
+  sudo tee /etc/apt/keyrings/homeautomationmonitorgw.gpg >/dev/null
+sudo chmod 0644 /etc/apt/keyrings/homeautomationmonitorgw.gpg
+rm -f /tmp/homeautomationmonitorgw-archive-key.asc
 ```
 
-The Debian package installs the binary under `/usr/sbin`, installs a matching systemd unit, creates the restricted service account and configuration directories, rejects symlinked or non-regular configuration targets, and copies example configuration only when no site file exists. It also ships the SIRAX example and third-party notices under `/usr/share`. It intentionally does not enable, start, or restart the service automatically. Finish configuration and provisioning, then run:
+Do not create the source entry if the fingerprint check fails. After a successful check, add the architecture-specific source and install both packages:
 
 ```bash
-sudo systemctl enable --now automation-gateway
+ARCH="$(dpkg --print-architecture)"
+case "$ARCH" in
+  amd64|arm64|armhf|i386) ;;
+  *) echo "unsupported architecture: $ARCH" >&2; exit 1 ;;
+esac
+
+printf '%s\n' \
+  "deb [arch=$ARCH signed-by=/etc/apt/keyrings/homeautomationmonitorgw.gpg] https://tseiman.github.io/HomeAutomationMonitorGW/apt stable main" | \
+  sudo tee /etc/apt/sources.list.d/homeautomationmonitorgw.list >/dev/null
+
+sudo apt update
+apt-cache policy automation-gateway automation-gateway-led
+sudo apt install --yes automation-gateway automation-gateway-led
 ```
 
-Choose either the archive installer or the Debian package for a host; do not mix the two installation methods, because they intentionally use their platform-appropriate binary and systemd package locations.
+For the first installation, edit `/etc/automation-gateway/config.yaml` and `/etc/automation-gateway-led/config.yaml`, provision their existing documented credentials and TLS/CA files, and validate both packages without opening LED hardware:
+
+```bash
+sudo -u automation-gateway \
+  /usr/sbin/automation-gateway \
+  --config=/etc/automation-gateway/config.yaml \
+  --check
+
+sudo -u automation-gateway-led \
+  /usr/sbin/automation-gateway-led \
+  --config=/etc/automation-gateway-led/config.yaml \
+  --check
+```
+
+After the gateway configuration and the RevPi `piTest` hardware check have passed, explicitly start the services:
+
+```bash
+sudo systemctl enable --now automation-gateway.service
+sudo systemctl enable --now automation-gateway-led.service
+sudo systemctl --no-pager --full status \
+  automation-gateway.service automation-gateway-led.service
+```
+
+For later updates, APT compares the package versions from the signed index. The packages deliberately do not restart running services during an upgrade, so validate the installed versions and restart both services explicitly:
+
+```bash
+sudo apt update
+apt list --upgradable
+sudo apt install --only-upgrade automation-gateway automation-gateway-led
+
+dpkg-query -W -f='${Package} ${Version}\n' \
+  automation-gateway automation-gateway-led
+sudo systemctl restart automation-gateway.service automation-gateway-led.service
+sudo systemctl --no-pager --full status \
+  automation-gateway.service automation-gateway-led.service
+sudo journalctl -u automation-gateway.service \
+  -u automation-gateway-led.service -n 100 --no-pager
+```
+
+A specific `.deb` and its adjacent checksum can still be downloaded from a GitHub Release for recovery or an offline installation. Verify the checksum and use `sudo apt install ./package.deb`; a manually downloaded file does not configure future APT updates.
+
+### Configure APT signing and GitHub Pages
+
+This is a one-time repository-administrator operation. The private signing key must never be committed. Keep the private export in an offline backup: GitHub Actions secrets can be replaced but cannot be read back after saving.
+
+1. Open the GitHub repository and select **Settings → Secrets and variables → Actions**.
+2. Select **New repository secret**.
+3. Set the name to `APT_SIGNING_PRIVATE_KEY`.
+4. Paste the complete private ASCII-armored key, including its `BEGIN` and `END` lines, and save it.
+5. Open **Settings → Pages** and select **GitHub Actions** as the build and deployment source.
+
+The committed public key is [`packaging/apt/homeautomationmonitorgw-archive-key.asc`](packaging/apt/homeautomationmonitorgw-archive-key.asc). Its pinned fingerprint is:
+
+```text
+FBB4 E68D ABB4 A25F 6E73  C81D D4EA 266E 8BC8 043F
+```
+
+During a tagged release, the workflow imports the secret into a new mode-`0700` temporary GnuPG home, checks the complete fingerprint against the committed public key, signs only the generated APT metadata, verifies both signatures, and removes the temporary keyring. The workflow does not print the secret and fails closed when the secret is absent or identifies another key. Repository administrators who can modify release workflows remain inside the signing trust boundary.
 
 ## Optional RevPi status LED client
 

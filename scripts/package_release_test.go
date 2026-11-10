@@ -32,6 +32,9 @@ func TestReleaseWorkflowUploadsTopLevelLicensesExactlyOnce(t *testing.T) {
 		t.Fatal("release job not found")
 	}
 	releaseJob := workflow[releaseIndex:]
+	if nextJob := strings.Index(releaseJob[len("\n  release:\n"):], "\n  apt-repository:\n"); nextJob >= 0 {
+		releaseJob = releaseJob[:len("\n  release:\n")+nextJob]
+	}
 	fields := strings.Fields(releaseJob)
 	for _, asset := range []string{"LICENSE", "THIRD_PARTY_LICENSES.md"} {
 		count := 0
@@ -44,7 +47,7 @@ func TestReleaseWorkflowUploadsTopLevelLicensesExactlyOnce(t *testing.T) {
 			t.Fatalf("release job references %s %d times, want exactly once", asset, count)
 		}
 	}
-	if !strings.Contains(releaseJob, "uses: actions/checkout@v4") || !strings.Contains(releaseJob, "release-assets/* LICENSE THIRD_PARTY_LICENSES.md") {
+	if !strings.Contains(releaseJob, "uses: actions/checkout@v7") || !strings.Contains(releaseJob, "release-assets/* LICENSE THIRD_PARTY_LICENSES.md") {
 		t.Fatalf("release job does not upload checked-out license assets exactly once:\n%s", releaseJob)
 	}
 }

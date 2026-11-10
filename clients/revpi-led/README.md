@@ -110,6 +110,10 @@ journalctl -u automation-gateway-led.service -n 50 --no-pager
 
 The installer preserves an existing configuration and token. Without `--start`, a previously inactive service remains inactive.
 
+## Install from the signed APT repository
+
+For RevPi installation and later updates through `apt update` and `apt upgrade`, follow the primary README's [signed APT repository instructions](../../README.md#install-and-update-from-the-signed-apt-repository). The repository ships `automation-gateway-led` separately from `automation-gateway`, preserves `/etc/automation-gateway-led/config.yaml` and its token/CA files during upgrades, and deliberately leaves service restart under operator control.
+
 ## Install from a release archive
 
 The project release script creates a separate optional archive and checksum for the LED client. It is not placed inside the normal gateway archive. The archive has one top-level `automation-gateway-led/` directory, so it can be extracted beside the gateway archive without mixing their files.
