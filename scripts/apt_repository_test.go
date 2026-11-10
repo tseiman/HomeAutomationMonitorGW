@@ -49,7 +49,7 @@ func TestBuildAPTRepositoryCreatesIndexedPool(t *testing.T) {
 
 	root := projectRoot(t)
 	packages := t.TempDir()
-	for _, name := range []string{"automation-gateway", "automation-gateway-led"} {
+	for _, name := range []string{"automation-gateway", "automation-gateway-led", "automation-gateway-zabbix"} {
 		buildTestDebianPackage(t, packages, name, "1.2.3", "arm64")
 	}
 
@@ -68,6 +68,7 @@ func TestBuildAPTRepositoryCreatesIndexedPool(t *testing.T) {
 	for _, expected := range []string{
 		"Package: automation-gateway\n",
 		"Package: automation-gateway-led\n",
+		"Package: automation-gateway-zabbix\n",
 		"Version: 1.2.3\n",
 		"Filename: pool/main/h/homeautomationmonitorgw/automation-gateway_1.2.3_arm64.deb\n",
 	} {
