@@ -10,6 +10,29 @@ HomeAutomationMonitorGW is a read-only Linux monitoring gateway. It polls config
 - Configuration is strict YAML; protected inputs and permissions are validated.
 - The service runs unprivileged and stores no telemetry database.
 
+## Contents
+
+- [Requirements](#requirements)
+- [Install and update with APT](#install-and-update-with-apt)
+  - [Add the repository](#add-the-repository)
+  - [Install the gateway](#install-the-gateway)
+  - [Install the optional LED client](#install-the-optional-led-client)
+  - [Update](#update)
+  - [Migrate an older archive installation](#migrate-an-older-archive-installation)
+- [Configuration](#configuration)
+  - [Server and authentication](#server-and-authentication)
+  - [Polling](#polling)
+  - [NUT](#nut)
+  - [SNMPv3](#snmpv3)
+  - [Generic Modbus RTU](#generic-modbus-rtu)
+- [Operation](#operation)
+  - [Local authenticated curl check](#local-authenticated-curl-check)
+- [API and Zabbix](#api-and-zabbix)
+- [Optional RevPi LED client](#optional-revpi-led-client)
+- [Alternative archive installation](#alternative-archive-installation)
+- [Security](#security)
+- [Detailed documentation](#detailed-documentation)
+
 ## Requirements
 
 - Linux on `amd64`, `arm64`, `armv7`/Debian `armhf`, or `386`/Debian `i386`.
@@ -187,6 +210,29 @@ sudo systemctl reload automation-gateway.service
 ```
 
 A valid reload atomically replaces configuration and collectors. Listen-address and server-timeout changes require a restart. A failed reload leaves the active runtime unchanged.
+
+### Local authenticated curl check
+
+Test the running service through loopback without disabling TLS verification. Set `GATEWAY_HOST` to a DNS name covered by the server certificate and `CA_FILE` to the issuing CA certificate:
+
+```bash
+(
+  GATEWAY_HOST='gateway.example.internal'
+  GATEWAY_PORT='8443'
+  CA_FILE='/path/to/ca.crt'
+  TOKEN_FILE='/etc/automation-gateway/tokens/zabbix'
+
+  TOKEN="$(sudo cat "$TOKEN_FILE")" || exit
+  printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" |
+    curl --config - \
+      --fail --silent --show-error \
+      --cacert "$CA_FILE" \
+      --resolve "${GATEWAY_HOST}:${GATEWAY_PORT}:127.0.0.1" \
+      "https://${GATEWAY_HOST}:${GATEWAY_PORT}/api/v1/status"
+)
+```
+
+`--resolve` connects to `127.0.0.1` while retaining the certificate hostname. A successful request prints the JSON status snapshot; TLS, authentication, connection, and HTTP errors return a non-zero exit status. The token exists only inside the subshell and is supplied to curl through standard input rather than its command line.
 
 ## API and Zabbix
 
