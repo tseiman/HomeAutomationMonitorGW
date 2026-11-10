@@ -113,6 +113,28 @@ func TestInstallAndUpdateLifecycle(t *testing.T) {
 	assertFileEquals(t, config, customConfig)
 }
 
+// TestPreprovisionedFreshInstallRequiresExplicitStart proves valid site configuration does not bypass --start.
+func TestPreprovisionedFreshInstallRequiresExplicitStart(t *testing.T) {
+	projectRoot := projectRoot(t)
+	testRoot := t.TempDir()
+	fakeBinDir := filepath.Join(t.TempDir(), "bin")
+	stateDir := filepath.Join(t.TempDir(), "state")
+	mustMkdirAll(t, fakeBinDir)
+	mustMkdirAll(t, stateDir)
+	writeFakeSystemTools(t, fakeBinDir)
+	config := filepath.Join(testRoot, "etc/automation-gateway/config.yaml")
+	mustWriteFile(t, config, "# pre-provisioned site configuration\n", 0o640)
+	mustWriteFile(t, config+".ready", "ready\n", 0o600)
+
+	candidate := writeCandidate(t, t.TempDir(), "preprovisioned")
+	runInstaller(t, projectRoot, testRoot, fakeBinDir, stateDir, candidate, true)
+	for _, state := range []string{"active", "enabled"} {
+		if _, err := os.Stat(filepath.Join(stateDir, state)); !os.IsNotExist(err) {
+			t.Fatalf("fresh pre-provisioned install changed service %s state without --start: %v", state, err)
+		}
+	}
+}
+
 // TestRootInvocationBuildsWithoutVerification proves an appliance-style root install builds local sources without running optional verification.
 func TestRootInvocationBuildsWithoutVerification(t *testing.T) {
 	projectRoot := projectRoot(t)

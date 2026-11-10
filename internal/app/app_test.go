@@ -13,14 +13,11 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/big"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,7 +29,6 @@ import (
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/config"
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/drivers/modbusrtu"
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/metrics"
-	"golang.org/x/sys/unix"
 )
 
 // pair creates a self-signed certificate and key named n in d for serial, returning their paths; unrecoverable setup failures are reported through t.
@@ -51,169 +47,6 @@ func writeConfig(t *testing.T, path, cert, key, token string) {
 	s := "server:\n  listen: '127.0.0.1:8443'\n  certificate: '" + cert + "'\n  private_key: '" + key + "'\nauthentication:\n  bearer_token_files:\n    - '" + token + "'\n  allowed_clients:\n    - '127.0.0.1'\nsources: []\n"
 	if err := os.WriteFile(path, []byte(s), 0o600); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestDisabledZabbixCreatesNoState(t *testing.T) {
-	d := t.TempDir()
-	cert, key := pair(t, d, "disabled-zabbix", 21)
-	token := filepath.Join(d, "token")
-	if err := os.WriteFile(token, []byte("disabled-zabbix-token"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := filepath.Join(d, "config.yaml")
-	state := filepath.Join(d, "absent", "cursor")
-	writeConfig(t, cfg, cert, key, token)
-	file, err := os.OpenFile(cfg, os.O_APPEND|os.O_WRONLY, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = fmt.Fprintf(file, "zabbix:\n  enabled: false\n  token_file: /missing/token\n  cursor_state_path: %s\n", state)
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtime, err := New(cfg, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtime.Close()
-	if _, err := os.Stat(filepath.Dir(state)); !os.IsNotExist(err) {
-		t.Fatalf("disabled worker created state: %v", err)
-	}
-}
-
-type signalingCollector struct {
-	once sync.Once
-	done chan struct{}
-}
-
-func (c *signalingCollector) Poll(context.Context) ([]metrics.Metric, error) {
-	c.once.Do(func() { close(c.done) })
-	return []metrics.Metric{}, nil
-}
-
-func TestZabbixCursorLockDoesNotPreventCollectorsFromStarting(t *testing.T) {
-	directory := t.TempDir()
-	cursor := filepath.Join(directory, "cursor")
-	lock, err := unix.Open(cursor+".lock", unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer unix.Close(lock)
-	if err := unix.Flock(lock, unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		t.Fatal(err)
-	}
-
-	collector := &signalingCollector{done: make(chan struct{})}
-	store := cache.New(time.Now)
-	store.Register("source", "test", time.Minute)
-	runtime := &Runtime{logger: slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))}
-	cfg := config.Config{
-		Zabbix: config.Zabbix{
-			Enabled: true, APIURL: "https://zabbix.invalid/api_jsonrpc.php", Host: "host",
-			PollInterval: config.Duration{Duration: 5 * time.Second}, InventoryInterval: config.Duration{Duration: 15 * time.Minute},
-			RequestTimeout: config.Duration{Duration: time.Second}, CursorStatePath: cursor,
-			BatchSize: 100, MaxPages: 100, MaxResponseBytes: 8 << 20,
-		},
-		Secrets: config.Secrets{ZabbixToken: "token"},
-	}
-	if err := runtime.startLocked([]sourceSpec{{name: "source", interval: time.Hour, timeout: time.Second, collector: collector}}, store, nil, cfg); err != nil {
-		t.Fatalf("collector generation rejected by unavailable Zabbix state: %v", err)
-	}
-	select {
-	case <-collector.done:
-	case <-time.After(time.Second):
-		t.Fatal("collector did not start while Zabbix cursor was locked")
-	}
-	runtime.cancel()
-	runtime.wg.Wait()
-}
-
-func TestEnabledZabbixWorkerUsesGenerationStoreAndReloads(t *testing.T) {
-	var mu sync.Mutex
-	requests := 0
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		requests++
-		mu.Unlock()
-		var request struct {
-			Params []any `json:"params"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			t.Error(err)
-			return
-		}
-		if r.Header.Get("Authorization") != "Bearer zabbix-api-secret" {
-			t.Errorf("authorization=%q", r.Header.Get("Authorization"))
-		}
-		data := make([]map[string]string, len(request.Params))
-		for i := range data {
-			data[i] = map[string]string{"itemid": fmt.Sprint(1000 + i)}
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "result": map[string]any{"response": "success", "data": data}, "id": 1})
-	}))
-	defer server.Close()
-
-	d := t.TempDir()
-	cert, key := pair(t, d, "zabbix-runtime", 22)
-	gatewayToken := filepath.Join(d, "gateway.token")
-	zabbixToken := filepath.Join(d, "zabbix.token")
-	caFile := filepath.Join(d, "zabbix-ca.pem")
-	if err := os.WriteFile(gatewayToken, []byte("gateway-token-value-0022"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(zabbixToken, []byte("zabbix-api-secret"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := filepath.Join(d, "config.yaml")
-	state := filepath.Join(d, "state", "cursor")
-	if err := os.MkdirAll(filepath.Dir(state), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	writeConfig(t, cfg, cert, key, gatewayToken)
-	file, err := os.OpenFile(cfg, os.O_APPEND|os.O_WRONLY, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = fmt.Fprintf(file, "zabbix:\n  enabled: true\n  api_url: %s\n  ca_file: %s\n  token_file: %s\n  host: gateway\n  poll_interval: 5s\n  inventory_interval: 5s\n  cursor_state_path: %s\n", server.URL, caFile, zabbixToken, state)
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	runtime, err := New(cfg, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitRequests := func(want int) {
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
-			mu.Lock()
-			got := requests
-			mu.Unlock()
-			if got >= want {
-				return
-			}
-			time.Sleep(time.Millisecond)
-		}
-		t.Fatalf("requests did not reach %d", want)
-	}
-	waitRequests(1)
-	if err := runtime.Reload(); err != nil {
-		t.Fatal(err)
-	}
-	waitRequests(2)
-	runtime.Close()
-	if _, err := os.Stat(state); err != nil {
-		t.Fatalf("cursor state: %v", err)
 	}
 }
 

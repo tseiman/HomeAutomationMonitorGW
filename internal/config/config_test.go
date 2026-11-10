@@ -290,6 +290,15 @@ func TestMultipleSourcesUsingSameDriver(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsRemovedTopLevelZabbixConfiguration(t *testing.T) {
+	d := t.TempDir()
+	token := writeSecret(t, d, "token", "test-token-value")
+	body := baseYAML([]string{token}, []string{"127.0.0.1"}) + "zabbix:\n  enabled: true\n"
+	if _, err := Load(writeConfigFile(t, d, body), false); err == nil || !strings.Contains(strings.ToLower(err.Error()), "zabbix") {
+		t.Fatalf("removed top-level zabbix configuration accepted: %v", err)
+	}
+}
+
 // TestExampleConfigurationParses keeps the distributed operator example synchronized with the strict schema.
 func TestExampleConfigurationParses(t *testing.T) {
 	got, err := Load("../../configs/config.example.yaml", false)
@@ -354,6 +363,13 @@ func TestReadSecretRejectsUnsafeFilesAndContent(t *testing.T) {
 	}
 	if _, err := readSecret(link); err == nil {
 		t.Fatal("symlink accepted")
+	}
+	hardlink := filepath.Join(d, "hardlink")
+	if err := os.Link(regular, hardlink); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSecret(regular); err == nil {
+		t.Fatal("multiply linked secret accepted")
 	}
 	large := filepath.Join(d, "large")
 	if err := os.WriteFile(large, []byte(strings.Repeat("x", 4097)), 0o600); err != nil {

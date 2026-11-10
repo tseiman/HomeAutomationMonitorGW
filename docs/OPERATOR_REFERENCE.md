@@ -28,7 +28,6 @@ HomeAutomationMonitorGW is a small, read-only Linux monitoring gateway. It polls
 - [MIB metadata with `mib2json`](#mib-metadata-with-mib2json)
   - [Which MIB files are needed?](#which-mib-files-are-needed)
 - [API and Zabbix](#api-and-zabbix)
-  - [Optional built-in delta forwarding](#optional-built-in-delta-forwarding)
   - [Live gateway status and SSE](#live-gateway-status-and-sse)
   - [WAGO K-bus Visualizer widget](#wago-k-bus-visualizer-widget)
   - [Per-collector health events for Honeycomb](#per-collector-health-events-for-honeycomb)
@@ -647,12 +646,6 @@ metadata_file: "/etc/automation-gateway/wago-750-880-metadata.json"
 > `HomeAuthMonitorGW` name, filename, group, and internal references so existing
 > installations can be updated without a template migration.
 
-### Optional built-in delta forwarding
-
-The optional worker inside `automation-gateway` consumes the active cache store directly and writes trapper history through Zabbix `history.push`. Its defaults are a 5-second delta poll and 15-minute inventory refresh; the gateway metric heartbeat defaults to 5 minutes. It does not alter gateway device polling and performs no self-HTTP requests. Constant values generally avoid repeated full-snapshot transfer, while frequently changing values still produce delta traffic and history writes. Enabling it requires only the normal `/etc/automation-gateway/config.yaml` and `automation-gateway.service`; there is no additional application, package, account, token for the gateway API, or service.
-
-Use the [migration guide](ZABBIX_DELTA_MIGRATION.md) for the normal gateway configuration, protected token/state modes, API-role and host permissions, frontend-IP `Allowed hosts`, operator-controlled template import, validation, cutover, and rollback. The [architecture note](architecture/zabbix-delta-integration.md) documents cursor commit order, snapshot-only discovery, timestamps, gap handling, and at-least-once delivery limits.
-
 Every endpoint requires both an allowed TCP peer and a bearer token:
 
 - `GET /api/v1/health`
@@ -762,7 +755,7 @@ curl --fail --no-buffer \
 
 The optional single-LED client displays `healthy idle = green`, `activity = yellow`, `health error/degraded = red`, and `not reachable = off`. Health errors override simultaneous activity. Multiple LEDs can display health and activity independently.
 
-Import [`zabbix/template_homeauthmonitorgw.yaml`](../zabbix/template_homeauthmonitorgw.yaml) under operator control, then enable the normal gateway's `zabbix:` block with the Zabbix API URL, protected token file, target host, cursor path, CA when required, and inventory/poll intervals. Set `{$AUTOMATION_GATEWAY_ALLOWED_HOSTS}` to the Zabbix frontend's actual source address because `history.push` originates from the frontend. The built-in worker submits trapper values and complete snapshot inventory directly from the active cache; it never contacts NUT, SNMP, or Modbus devices itself. Follow [the migration guide](ZABBIX_DELTA_MIGRATION.md) for API-role permissions, staged verification, and rollback.
+Import [`zabbix/template_homeauthmonitorgw.yaml`](../zabbix/template_homeauthmonitorgw.yaml), set `{$AUTOMATION_GATEWAY_URL}`, secret `{$AUTOMATION_GATEWAY_TOKEN}`, `{$AUTOMATION_GATEWAY_INTERVAL}`, and `{$AUTOMATION_GATEWAY_TIMEOUT}`, and keep certificate verification enabled. Add the Zabbix server/proxy's actual TCP source address to `authentication.allowed_clients`. The template uses one HTTP-agent master item to fetch `/api/v1/metrics/all`; its preprocessing converts the atomic `sources` array to the legacy source-keyed object used by dependent discovery/items. The gateway has no Zabbix API credential, integration state, or outbound connection. Native Zabbix HTTP items do not retain the opaque delta cursor in this template; cursor-capable clients use the generic delta loop described above.
 
 The template stores strings as text and numeric metrics as trendable numeric items. SNMP TimeTicks are converted from centiseconds to seconds; `sysUpTime` uses Zabbix's `uptime` unit for a human-readable duration. The WAGO RTC value map displays `0` as `OK` and `1` as `Battery empty` without changing the numeric value used for alerting.
 
@@ -783,7 +776,7 @@ Every source discovered later also receives its own `automation.gateway.source.h
 - `1` — **Degraded**: not initialized, stale, empty data, missing expected health metrics, a warning threshold, or another non-critical condition.
 - `2` — **Real issue / unavailable**: the collector is unavailable, a confirmed device error is present, or a critical threshold is crossed.
 
-`automation.gateway.health.overall` is the layer above every collector. The highest state wins (`max`), so a real issue (`2`) dominates degraded (`1`) and good (`0`). Before the trapper snapshot item has received its first complete snapshot, dependent items cannot have a value; the separate snapshot-item `nodata(...,5m)` trigger covers that condition. A valid snapshot with no configured sources returns degraded (`1`).
+`automation.gateway.health.overall` is the layer above every collector. The highest state wins (`max`), so a real issue (`2`) dominates degraded (`1`) and good (`0`). Before the HTTPS master item has received its first snapshot, dependent items cannot have a value; the separate master-item `nodata(...,5m)` trigger covers that condition. A valid snapshot with no configured sources returns degraded (`1`).
 
 ### WAGO K-bus Visualizer widget
 
@@ -1142,7 +1135,7 @@ sudo systemctl restart automation-gateway
 
 ## Security summary
 
-- Keep forwarding disabled and permit HTTPS only from approved monitoring clients.
+- Permit inbound HTTPS only from approved monitoring clients; the gateway does not connect to monitoring systems.
 - Keep upsd loopback-only and field-device protocols inside the automation network.
 - Never place tokens, SNMP passphrases, or private keys in YAML, source control, command lines, tickets, or logs.
 - Keep every API endpoint, including health, behind the client allowlist and bearer-token policy.

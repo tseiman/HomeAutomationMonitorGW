@@ -50,7 +50,8 @@ func TestReleaseWorkflowUploadsTopLevelLicensesExactlyOnce(t *testing.T) {
 	if !strings.Contains(releaseJob, "uses: actions/checkout@v7") || !strings.Contains(releaseJob, "release-assets/* LICENSE THIRD_PARTY_LICENSES.md") {
 		t.Fatalf("release job does not upload checked-out license assets exactly once:\n%s", releaseJob)
 	}
-	if strings.Contains(workflow, "automation-gateway-zabbix") {
+	legacySeparateArtifact := "automation-gateway-" + "zabbix"
+	if strings.Contains(workflow, legacySeparateArtifact) {
 		t.Fatal("release workflow still publishes a separate Zabbix artifact")
 	}
 }

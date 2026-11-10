@@ -1,50 +1,38 @@
-# Zabbix delta integration architecture
+# Passive monitoring integration architecture
 
-## Data path
+## Network direction
 
 ```text
 NUT / SNMPv3 / Modbus RTU
-          │ read-only collector polls
+          │ scheduled read-only collector polls
           ▼
-automation-gateway cache + bounded transaction journal
-          │ direct in-process Store.Full / Store.Delta adapter
-          ▼
-optional automation-gateway Zabbix worker
-          │ HTTPS JSON-RPC: history.push
-          ▼
-Zabbix trapper items and history
+automation-gateway in-memory cache + bounded journal
+          ▲
+          │ authenticated HTTPS GET
+          │
+Zabbix HTTP agent or another pull client
 ```
 
-The worker is part of the standard process, package, account, configuration, and systemd lifecycle. It never polls a device through HTTP and needs no gateway URL or gateway token. The authenticated `/api/v1/metrics/all` and `/api/v1/metrics/delta?since=<cursor>` routes remain available to external consumers.
+The gateway only listens and responds. It has no outbound monitoring-system client, remote API credential, callback, sender process, or integration-specific state file. HTTP handlers read the cache and journal; they never initiate or accelerate device polls.
 
-## Lifecycle
+## Snapshot and replay contract
 
-When disabled, the gateway does not load a Zabbix token, validate/open Zabbix-specific CA or cursor state, create a worker, or make Zabbix requests. When enabled, candidate configuration and protected files are validated before the active runtime is stopped. The worker starts under the same generation context as collectors. Reload and shutdown cancel it, wait for it, then close its cursor lock/resources.
+`GET /api/v1/metrics/all` copies the complete source snapshot and its matching opaque cursor under one lock. A cursor-capable client then requests `GET /api/v1/metrics/delta?since=<cursor>` and applies complete transactions in order.
 
-Each cache generation has a new cursor identity. Therefore a newly started replacement worker naturally bootstraps from the active store. Zabbix polling errors are logged and retried without terminating collectors or the HTTPS server.
+The client owns the cursor:
 
-## Replay and cursor commit order
+1. apply the full `sources` snapshot and retain its `cursor`;
+2. request a delta with that cursor;
+3. apply all transactions and advance only to `next_cursor` after successful local application;
+4. while `has_more` is true, immediately request the next page with `next_cursor`;
+5. otherwise poll later from the last applied cursor.
 
-On first use, after a runtime-generation change, or after an expired cursor, the worker calls `Store.Full`. It pushes the snapshot item first, pushes snapshot metric and source-health values, and commits the returned cursor only after all pushes succeed. During normal replay it calls `Store.Delta` and processes journal transactions in order:
+A failed or ambiguous request is retried with the same cursor. Reads do not consume journal entries, so multiple readers may start at different points and replay independently. Transactions retain intermediate values, metadata changes, status transitions, removals, discovery changes, and heartbeat records.
 
-1. derive generic history keys while preserving metric/transaction timestamps;
-2. complete every `history.push` batch;
-3. atomically persist that transaction's cursor at the configured path (default `/var/lib/automation-gateway/zabbix-cursor`).
+An expired cursor returns `410 Gone`. A cursor from a different process or reload generation returns `409 Conflict` with `reset_required: true`. A future cursor returns `409 Conflict`; malformed input returns `400 Bad Request`. Expired and wrong-generation readers discard incremental state and bootstrap again from `/api/v1/metrics/all`.
 
-Failed or ambiguous pushes never advance the cursor, so restart/retry provides **at-least-once delivery**, not exactly-once delivery. Zabbix may receive a duplicate `(host, key, clock, ns, value)` after an ambiguous response; operators must not assume deduplication.
+## Zabbix template
 
-Wrong-generation and expired cursors request bootstrap/resynchronization. Malformed and future cursors fail closed. Non-progressing pages and unexplained schema/sequence errors also fail closed.
+The shipped Zabbix 7.4 template uses one authenticated HTTPS HTTP-agent master item. It fetches `/api/v1/metrics/all`, verifies the certificate peer and hostname, and transforms the versioned `sources` array to the historical source-keyed object used by dependent items and discovery rules. Its bearer value is a Zabbix `SECRET_TEXT` macro sent in the HTTP header. The gateway allowlist must include the actual Zabbix server or proxy source address.
 
-## Snapshot-only discovery
-
-Low-level discovery and dependent inventory items use only the complete `automation.gateway.snapshot`. The worker refreshes that snapshot every 15 minutes by default after draining replayable deltas, without moving the replay cursor. Delta transactions carry metric and health history, not partial discovery documents.
-
-The mapping is generic. Numeric, boolean, text, and hexadecimal values are selected by schema metadata and stable identities; no device class, source name, OID family, or vendor model is hardcoded.
-
-## Timing, logs, and load
-
-Defaults are a 5-second delta poll, 15-minute inventory refresh, 10-second request timeout, and the gateway's 5-minute unchanged-value heartbeat. Metric timestamps come from the metric; source-health records use transaction capture time; inventory uses full-snapshot capture time.
-
-Startup, recovery, and shutdown logs identify only the Zabbix endpoint/host. Tokens are excluded, and successful polls do not create five-second log spam.
-
-Delta forwarding reduces repeated full-snapshot transfer for constant metrics. It does not reduce configured device polling, and frequently changing values still require network transfer and Zabbix history processing. Measure frontend, server, and database effects in the target environment.
+Native Zabbix HTTP items do not retain the gateway's opaque replay cursor in this template. Periodic full snapshots preserve the existing dependent-item, discovery, and dashboard behavior; the delta endpoint remains available to pull clients that implement cursor ownership explicitly.

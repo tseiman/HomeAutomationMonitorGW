@@ -13,7 +13,6 @@ import (
 	"math"
 	"net"
 	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -54,26 +53,9 @@ type Config struct {
 	Server         Server         `yaml:"server"`
 	Authentication Authentication `yaml:"authentication"`
 	Delta          Delta          `yaml:"delta"`
-	Zabbix         Zabbix         `yaml:"zabbix"`
 	Sources        []Source       `yaml:"sources"`
 	Logging        Logging        `yaml:"logging"`
 	Secrets        Secrets        `yaml:"-"`
-}
-
-// Zabbix configures the optional in-process history.push worker.
-type Zabbix struct {
-	Enabled           bool     `yaml:"enabled"`
-	APIURL            string   `yaml:"api_url"`
-	CAFile            string   `yaml:"ca_file"`
-	TokenFile         string   `yaml:"token_file"`
-	Host              string   `yaml:"host"`
-	PollInterval      Duration `yaml:"poll_interval"`
-	InventoryInterval Duration `yaml:"inventory_interval"`
-	RequestTimeout    Duration `yaml:"request_timeout"`
-	CursorStatePath   string   `yaml:"cursor_state_path"`
-	BatchSize         int      `yaml:"batch_size"`
-	MaxPages          int      `yaml:"max_pages"`
-	MaxResponseBytes  int64    `yaml:"max_response_bytes"`
 }
 
 // Delta bounds the in-memory change journal and unchanged-value heartbeats.
@@ -260,7 +242,6 @@ type Secrets struct {
 	BearerTokens   []string
 	AllowedClients []netip.Prefix
 	Sources        map[string]SourceSecrets
-	ZabbixToken    string
 }
 
 // UnmarshalYAML defaults an omitted enabled flag to true and makes disabled sources semantically inert.
@@ -521,16 +502,6 @@ func mergeYAMLNodes(base, overlay *yaml.Node) *yaml.Node {
 // loadSecrets securely loads all active authentication and per-source credentials into c.
 func (c *Config) loadSecrets() error {
 	c.Secrets = Secrets{Sources: make(map[string]SourceSecrets)}
-	if c.Zabbix.Enabled {
-		value, err := readSecret(c.Zabbix.TokenFile)
-		if err != nil {
-			return fmt.Errorf("zabbix token %q: %w", c.Zabbix.TokenFile, err)
-		}
-		if err := validateSecret(value, 1, 4096, true); err != nil {
-			return fmt.Errorf("zabbix token %q: %w", c.Zabbix.TokenFile, err)
-		}
-		c.Secrets.ZabbixToken = value
-	}
 	seenTokens := make(map[string]struct{}, len(c.Authentication.BearerTokenFiles))
 	for _, path := range c.Authentication.BearerTokenFiles {
 		value, err := readSecret(path)
@@ -578,27 +549,6 @@ func (c *Config) loadSecrets() error {
 
 // defaults fills omitted optional settings with operational defaults, skipping disabled sources completely.
 func (c *Config) defaults() {
-	if !c.Zabbix.PollInterval.set {
-		c.Zabbix.PollInterval.Duration = 5 * time.Second
-	}
-	if !c.Zabbix.InventoryInterval.set {
-		c.Zabbix.InventoryInterval.Duration = 15 * time.Minute
-	}
-	if !c.Zabbix.RequestTimeout.set {
-		c.Zabbix.RequestTimeout.Duration = 10 * time.Second
-	}
-	if c.Zabbix.CursorStatePath == "" {
-		c.Zabbix.CursorStatePath = "/var/lib/automation-gateway/zabbix-cursor"
-	}
-	if c.Zabbix.BatchSize == 0 {
-		c.Zabbix.BatchSize = 100
-	}
-	if c.Zabbix.MaxPages == 0 {
-		c.Zabbix.MaxPages = 100
-	}
-	if c.Zabbix.MaxResponseBytes == 0 {
-		c.Zabbix.MaxResponseBytes = 8 << 20
-	}
 	if !c.Delta.Heartbeat.set {
 		c.Delta.Heartbeat.Duration = 5 * time.Minute
 	}
@@ -695,27 +645,6 @@ func (c *Config) defaults() {
 
 // Validate checks server, authentication, active-source, timing, address, and protocol constraints.
 func (c Config) Validate() error {
-	if c.Zabbix.Enabled {
-		u, err := url.Parse(c.Zabbix.APIURL)
-		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-			return errors.New("zabbix.api_url must be an HTTPS URL without credentials, query, or fragment")
-		}
-		if c.Zabbix.TokenFile == "" || c.Zabbix.Host == "" {
-			return errors.New("zabbix.token_file and zabbix.host are required when enabled")
-		}
-		if c.Zabbix.PollInterval.Duration < 5*time.Second || c.Zabbix.InventoryInterval.Duration < 5*time.Second {
-			return errors.New("zabbix poll_interval and inventory_interval must be at least 5s")
-		}
-		if c.Zabbix.RequestTimeout.Duration <= 0 || c.Zabbix.RequestTimeout.Duration > 10*time.Minute {
-			return errors.New("zabbix.request_timeout must be positive and not exceed 10m")
-		}
-		if !filepath.IsAbs(c.Zabbix.CursorStatePath) {
-			return errors.New("zabbix.cursor_state_path must be absolute")
-		}
-		if c.Zabbix.BatchSize < 1 || c.Zabbix.BatchSize > 1000 || c.Zabbix.MaxPages < 1 || c.Zabbix.MaxPages > 10000 || c.Zabbix.MaxResponseBytes < 1024 || c.Zabbix.MaxResponseBytes > 64<<20 {
-			return errors.New("zabbix bounded batch/page/response settings are invalid")
-		}
-	}
 	if c.Delta.Heartbeat.Duration < 5*time.Second || c.Delta.Heartbeat.Duration > 24*time.Hour {
 		return errors.New("delta.heartbeat must be between 5s and 24h")
 	}

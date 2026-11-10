@@ -117,6 +117,37 @@ func TestDeltaFailuresRecoveryReplayMultipleReadersAndAtomicFullCut(t *testing.T
 	}
 }
 
+func TestDeltaReadersOwnIndependentCursorsAtDifferentBootstrapPoints(t *testing.T) {
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	store := New(func() time.Time { return now }, Options{Heartbeat: time.Minute, RetentionAge: time.Hour, MaxEvents: 100, MaxBytes: 1 << 20})
+	store.Register("source", "test", time.Minute)
+	clientA := store.Full().Cursor
+
+	store.Success("source", []metrics.Metric{metric("key", "value", int64(1), now)}, time.Millisecond)
+	clientB := store.Full().Cursor
+	now = now.Add(time.Second)
+	store.Success("source", []metrics.Metric{metric("key", "value", int64(2), now)}, time.Millisecond)
+	now = now.Add(time.Second)
+	store.Success("source", []metrics.Metric{metric("key", "value", int64(1), now)}, time.Millisecond)
+
+	aFirst, err := store.Delta(clientA)
+	if err != nil || len(aFirst.Transactions) != 3 {
+		t.Fatalf("client A replay=%+v err=%v", aFirst, err)
+	}
+	bFirst, err := store.Delta(clientB)
+	if err != nil || len(bFirst.Transactions) != 2 {
+		t.Fatalf("client B replay=%+v err=%v", bFirst, err)
+	}
+	if aFirst.Transactions[1].Metrics[0].Metric.Value != int64(2) || aFirst.Transactions[2].Metrics[0].Metric.Value != int64(1) {
+		t.Fatalf("intermediate and return values lost: %+v", aFirst.Transactions)
+	}
+	aAgain, _ := store.Delta(clientA)
+	bAgain, _ := store.Delta(clientB)
+	if !reflect.DeepEqual(aFirst, aAgain) || !reflect.DeepEqual(bFirst, bAgain) {
+		t.Fatal("one reader consumed or changed another reader's replay")
+	}
+}
+
 func TestDeltaPaginatesWholeTransactions(t *testing.T) {
 	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
 	store := New(func() time.Time { return now }, Options{Heartbeat: time.Minute, RetentionAge: time.Hour, MaxEvents: 2000, MaxBytes: 8 << 20})

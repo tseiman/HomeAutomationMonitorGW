@@ -12,7 +12,7 @@ func TestGatewayUnitKeepsSerialDevicesVisibleWithoutRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	unit := string(data)
-	for _, required := range []string{"User=automation-gateway", "Group=automation-gateway", "NoNewPrivileges=yes", "StateDirectory=automation-gateway", "StateDirectoryMode=0700"} {
+	for _, required := range []string{"User=automation-gateway", "Group=automation-gateway", "NoNewPrivileges=yes"} {
 		if !strings.Contains(unit, required) {
 			t.Fatalf("unit lacks %q", required)
 		}

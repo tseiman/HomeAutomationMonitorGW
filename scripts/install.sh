@@ -499,10 +499,6 @@ install_phase() {
         return 0
     fi
 
-    if [[ "$had_binary" == "false" && "$config_created" == "false" ]]; then
-        FORCE_START=true
-    fi
-
     if [[ "$FORCE_START" == "true" ]]; then
         if ! systemctl enable --now "$SERVICE_NAME"; then
             if [[ "$deployment_changed" == "true" ]]; then

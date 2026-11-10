@@ -27,6 +27,20 @@ func TestDeltaAPIFullReplayErrorsAndLegacyShape(t *testing.T) {
 	store.Register("generic", "test", time.Minute)
 	store.Success("generic", []metrics.Metric{{Identity: "protocol/key", Name: "display", Value: true, ValueType: "boolean", Timestamp: now}}, time.Millisecond)
 	handler := deltaHandler(store)
+	headBeforeRequests := store.Cursor()
+
+	unauthorized := httptest.NewRecorder()
+	handler.ServeHTTP(unauthorized, request(http.MethodGet, "/api/v1/metrics/all", ""))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized full snapshot status=%d", unauthorized.Code)
+	}
+	disallowedRequest := request(http.MethodGet, "/api/v1/metrics/delta?since="+headBeforeRequests, "Bearer delta-api-token-value")
+	disallowedRequest.RemoteAddr = "198.51.100.25:32100"
+	disallowed := httptest.NewRecorder()
+	handler.ServeHTTP(disallowed, disallowedRequest)
+	if disallowed.Code != http.StatusForbidden {
+		t.Fatalf("disallowed delta status=%d", disallowed.Code)
+	}
 
 	fullRecorder := httptest.NewRecorder()
 	handler.ServeHTTP(fullRecorder, request(http.MethodGet, "/api/v1/metrics/all", "Bearer delta-api-token-value"))
@@ -42,6 +56,9 @@ func TestDeltaAPIFullReplayErrorsAndLegacyShape(t *testing.T) {
 	handler.ServeHTTP(deltaRecorder, request(http.MethodGet, "/api/v1/metrics/delta?since="+full.Cursor, "Bearer delta-api-token-value"))
 	if deltaRecorder.Code != http.StatusOK {
 		t.Fatalf("delta status=%d body=%s", deltaRecorder.Code, deltaRecorder.Body.String())
+	}
+	if got := store.Cursor(); got != headBeforeRequests {
+		t.Fatalf("HTTP cache reads changed journal head: before=%s after=%s", headBeforeRequests, got)
 	}
 
 	legacy := httptest.NewRecorder()
