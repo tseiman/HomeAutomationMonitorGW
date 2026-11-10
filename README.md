@@ -17,6 +17,7 @@ HomeAutomationMonitorGW is a read-only Linux monitoring gateway. It polls config
   - [Add the repository](#add-the-repository)
   - [Install the gateway](#install-the-gateway)
   - [Install the optional LED client](#install-the-optional-led-client)
+  - [Install the optional Zabbix delta bridge](#install-the-optional-zabbix-delta-bridge)
   - [Update](#update)
   - [Migrate an older archive installation](#migrate-an-older-archive-installation)
 - [Configuration](#configuration)
@@ -45,7 +46,7 @@ The optional LED client requires a supported Revolution Pi, an `automation-gatew
 
 ## Install and update with APT
 
-The signed repository provides the independently installable `automation-gateway` and `automation-gateway-led` packages. Packages preserve existing configuration and credentials and intentionally do not start or restart services.
+The signed repository provides independently installable gateway, LED-client, and Zabbix delta-bridge packages. Packages preserve existing configuration and credentials and intentionally do not start or restart services.
 
 ### Add the repository
 
@@ -121,6 +122,20 @@ sudo -u automation-gateway-led /usr/sbin/automation-gateway-led \
 sudo systemctl enable --now automation-gateway-led.service
 ```
 
+### Install the optional Zabbix delta bridge
+
+The bridge replays gateway journal deltas into Zabbix trapper items through `history.push`; it needs no device access. Installation does not import the supplied template or enable/start the service.
+
+```bash
+sudo apt install automation-gateway-zabbix
+sudoedit /etc/automation-gateway-zabbix/config.yaml
+sudo -u automation-gateway-zabbix /usr/sbin/automation-gateway-zabbix \
+  -config /etc/automation-gateway-zabbix/config.yaml -check
+sudo systemctl enable --now automation-gateway-zabbix.service
+```
+
+Follow the [operator migration guide](docs/ZABBIX_DELTA_MIGRATION.md) for Zabbix permissions, template import, staged verification, and rollback. See the [delta integration architecture](docs/architecture/zabbix-delta-integration.md) for delivery and load semantics.
+
 ### Update
 
 ```bash
@@ -129,7 +144,7 @@ sudo apt install --only-upgrade automation-gateway automation-gateway-led
 sudo systemctl restart automation-gateway.service automation-gateway-led.service
 ```
 
-Omit the LED package and service when it is not installed. Validate configuration before restarting when an update requires configuration changes.
+Add `automation-gateway-zabbix` and restart its service when the bridge is installed; omit optional packages and services that are not installed. Validate configuration before restarting when an update requires configuration changes.
 
 ### Migrate an older archive installation
 

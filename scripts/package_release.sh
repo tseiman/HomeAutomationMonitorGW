@@ -16,8 +16,10 @@ LED_STAGE_DIR=""
 WINDOWS_STAGE_DIR=""
 DEB_STAGE_DIR=""
 LED_DEB_STAGE_DIR=""
+ZABBIX_DEB_STAGE_DIR=""
 LINUX_BUILD_TEMP=""
 LED_BUILD_TEMP=""
+ZABBIX_BUILD_TEMP=""
 
 usage() {
     cat <<'USAGE'
@@ -40,6 +42,8 @@ Outputs are written to the repository root by default:
   automation-gateway-led-linux-ARCH.sha256
   automation-gateway-led-VERSION-linux-ARCH.tar.gz
   automation-gateway-led-VERSION-linux-ARCH.tar.gz.sha256
+  automation-gateway-zabbix-linux-ARCH
+  automation-gateway-zabbix-linux-ARCH.sha256
 
 The LED client outputs are separate and optional; installing the gateway archive does
 not install or enable the LED service.
@@ -79,11 +83,17 @@ cleanup() {
     if [[ -n "$LED_DEB_STAGE_DIR" && -d "$LED_DEB_STAGE_DIR" ]]; then
         rm -rf "$LED_DEB_STAGE_DIR"
     fi
+    if [[ -n "$ZABBIX_DEB_STAGE_DIR" && -d "$ZABBIX_DEB_STAGE_DIR" ]]; then
+        rm -rf "$ZABBIX_DEB_STAGE_DIR"
+    fi
     if [[ -n "$LINUX_BUILD_TEMP" && -f "$LINUX_BUILD_TEMP" ]]; then
         rm -f "$LINUX_BUILD_TEMP"
     fi
     if [[ -n "$LED_BUILD_TEMP" && -f "$LED_BUILD_TEMP" ]]; then
         rm -f "$LED_BUILD_TEMP"
+    fi
+    if [[ -n "$ZABBIX_BUILD_TEMP" && -f "$ZABBIX_BUILD_TEMP" ]]; then
+        rm -f "$ZABBIX_BUILD_TEMP"
     fi
 }
 trap cleanup EXIT
@@ -500,6 +510,80 @@ EOF_LED_POSTRM
     log "created $deb_name"
 }
 
+build_zabbix_debian_package() {
+    local deb_version deb_name deb_path control postinst prerm postrm
+    require_command dpkg-deb
+    deb_version="$(debian_version "$VERSION")"
+    deb_name="automation-gateway-zabbix_${deb_version}_${DEB_ARCH}.deb"
+    deb_path="$OUTPUT_DIR/$deb_name"
+    ZABBIX_DEB_STAGE_DIR="$(mktemp -d "${PACKAGE_TMPDIR:-/tmp}/automation-gateway-zabbix.deb-stage.XXXXXX")"
+    chmod 0755 "$ZABBIX_DEB_STAGE_DIR"
+    install -d -m 0755 "$ZABBIX_DEB_STAGE_DIR/DEBIAN" "$ZABBIX_DEB_STAGE_DIR/usr/sbin" "$ZABBIX_DEB_STAGE_DIR/usr/share/automation-gateway-zabbix" "$ZABBIX_DEB_STAGE_DIR/usr/share/doc/automation-gateway-zabbix" "$ZABBIX_DEB_STAGE_DIR/lib/systemd/system"
+    install -m 0755 "$ZABBIX_BINARY_PATH" "$ZABBIX_DEB_STAGE_DIR/usr/sbin/automation-gateway-zabbix"
+    install -m 0644 "$PROJECT_ROOT/systemd/automation-gateway-zabbix.service" "$ZABBIX_DEB_STAGE_DIR/lib/systemd/system/automation-gateway-zabbix.service"
+    install -m 0644 "$PROJECT_ROOT/configs/zabbix-bridge.example.yaml" "$ZABBIX_DEB_STAGE_DIR/usr/share/automation-gateway-zabbix/config.example.yaml"
+    install -m 0644 "$PROJECT_ROOT/zabbix/template_homeauthmonitorgw.yaml" "$ZABBIX_DEB_STAGE_DIR/usr/share/automation-gateway-zabbix/template_homeauthmonitorgw.yaml"
+    install -m 0644 "$PROJECT_ROOT/THIRD_PARTY_LICENSES.md" "$ZABBIX_DEB_STAGE_DIR/usr/share/doc/automation-gateway-zabbix/THIRD_PARTY_LICENSES.md"
+    install -m 0644 "$PROJECT_ROOT/LICENSE" "$ZABBIX_DEB_STAGE_DIR/usr/share/doc/automation-gateway-zabbix/copyright"
+    control="$ZABBIX_DEB_STAGE_DIR/DEBIAN/control"
+    cat > "$control" <<EOF_ZABBIX_CONTROL
+Package: automation-gateway-zabbix
+Version: $deb_version
+Section: net
+Priority: optional
+Architecture: $DEB_ARCH
+Maintainer: aiAgentTseiman <ai-agent.tseiman@tseiman.de>
+Depends: adduser, systemd, ca-certificates
+Description: Delta-to-trapper bridge for HomeAutomationMonitorGW and Zabbix
+ Replays gateway journal transactions into Zabbix history.push and periodically
+ refreshes the complete snapshot used by low-level discovery.
+EOF_ZABBIX_CONTROL
+    chmod 0644 "$control"
+    postinst="$ZABBIX_DEB_STAGE_DIR/DEBIAN/postinst"
+    cat > "$postinst" <<'EOF_ZABBIX_POSTINST'
+#!/bin/sh
+set -e
+die() { echo "automation-gateway-zabbix: $*" >&2; exit 1; }
+reject_symlink() { [ ! -L "$1" ] || die "refusing symlink: $1"; }
+if ! getent group automation-gateway-zabbix >/dev/null; then addgroup --system automation-gateway-zabbix; fi
+if ! getent passwd automation-gateway-zabbix >/dev/null; then adduser --system --ingroup automation-gateway-zabbix --no-create-home --home /nonexistent --shell /usr/sbin/nologin automation-gateway-zabbix; fi
+reject_symlink /etc/automation-gateway-zabbix
+if [ -e /etc/automation-gateway-zabbix ] && [ ! -d /etc/automation-gateway-zabbix ]; then die "expected directory: /etc/automation-gateway-zabbix"; fi
+install -d -o root -g automation-gateway-zabbix -m 0750 /etc/automation-gateway-zabbix
+reject_symlink /etc/automation-gateway-zabbix/config.yaml
+if [ -e /etc/automation-gateway-zabbix/config.yaml ]; then
+    [ -f /etc/automation-gateway-zabbix/config.yaml ] || die "expected regular configuration: /etc/automation-gateway-zabbix/config.yaml"
+else
+    install -o root -g automation-gateway-zabbix -m 0640 /usr/share/automation-gateway-zabbix/config.example.yaml /etc/automation-gateway-zabbix/config.yaml
+fi
+if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi
+exit 0
+EOF_ZABBIX_POSTINST
+    chmod 0755 "$postinst"
+    prerm="$ZABBIX_DEB_STAGE_DIR/DEBIAN/prerm"
+    cat > "$prerm" <<'EOF_ZABBIX_PRERM'
+#!/bin/sh
+set -e
+case "${1:-}" in
+    remove|deconfigure) if command -v systemctl >/dev/null 2>&1; then systemctl stop automation-gateway-zabbix.service || true; fi ;;
+esac
+exit 0
+EOF_ZABBIX_PRERM
+    chmod 0755 "$prerm"
+    postrm="$ZABBIX_DEB_STAGE_DIR/DEBIAN/postrm"
+    cat > "$postrm" <<'EOF_ZABBIX_POSTRM'
+#!/bin/sh
+set -e
+if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; fi
+exit 0
+EOF_ZABBIX_POSTRM
+    chmod 0755 "$postrm"
+    rm -f "$deb_path"
+    dpkg-deb --root-owner-group --build "$ZABBIX_DEB_STAGE_DIR" "$deb_path" >/dev/null
+    write_sha256 "$deb_path"
+    log "created $deb_name"
+}
+
 [[ $# -ge 1 && $# -le 2 ]] || { usage >&2; exit 2; }
 TARGET_ARCH="$1"
 if [[ $# -eq 2 ]]; then
@@ -592,6 +676,20 @@ LED_BUILD_TEMP=""
 write_sha256 "$LED_BINARY_PATH"
 log "created $LED_BINARY_NAME"
 
+ZABBIX_BINARY_NAME="automation-gateway-zabbix-linux-${ARCH_LABEL}"
+ZABBIX_BINARY_PATH="$OUTPUT_DIR/$ZABBIX_BINARY_NAME"
+ZABBIX_BUILD_TEMP="$(mktemp "${PACKAGE_TMPDIR:-/tmp}/automation-gateway-zabbix.linux.XXXXXX")"
+if [[ -n "$GOARM_VALUE" ]]; then
+    (cd "$PROJECT_ROOT" && CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH_VALUE" GOARM="$GOARM_VALUE" GOPROXY=off go build -trimpath -ldflags "$LDFLAGS" -o "$ZABBIX_BUILD_TEMP" ./cmd/automation-gateway-zabbix)
+else
+    (cd "$PROJECT_ROOT" && CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH_VALUE" GOPROXY=off go build -trimpath -ldflags "$LDFLAGS" -o "$ZABBIX_BUILD_TEMP" ./cmd/automation-gateway-zabbix)
+fi
+install -m 0755 "$ZABBIX_BUILD_TEMP" "$ZABBIX_BINARY_PATH"
+rm -f "$ZABBIX_BUILD_TEMP"
+ZABBIX_BUILD_TEMP=""
+write_sha256 "$ZABBIX_BINARY_PATH"
+log "created $ZABBIX_BINARY_NAME"
+
 STAGE_DIR="$(mktemp -d "${PACKAGE_TMPDIR:-/tmp}/automation-gateway.linux-stage.XXXXXX")"
 install -d -m 0755 "$STAGE_DIR/automation-gateway"
 copy_linux_material "$LINUX_BINARY_PATH" "$STAGE_DIR/automation-gateway"
@@ -614,6 +712,7 @@ build_windows_package_if_supported
 if [[ "$BUILD_DEB" == "true" ]]; then
     build_debian_package
     build_led_debian_package
+    build_zabbix_debian_package
 fi
 
 log "release material written to $OUTPUT_DIR"

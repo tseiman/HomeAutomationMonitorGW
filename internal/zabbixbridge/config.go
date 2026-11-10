@@ -56,7 +56,7 @@ type configWire struct {
 func LoadConfig(path string) (Config, error) { return loadConfig(path) }
 
 func loadConfig(path string) (Config, error) {
-	f, err := os.Open(path)
+	f, err := openProtectedRegular(path, "configuration")
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
 	}
@@ -134,27 +134,11 @@ func durationDefault(value string, fallback time.Duration) (time.Duration, error
 }
 
 func readSecret(path string) (string, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	f, err := openProtectedRegular(path, "secret")
 	if err != nil {
 		return "", err
-	}
-	f := os.NewFile(uintptr(fd), path)
-	if f == nil {
-		_ = unix.Close(fd)
-		return "", fmt.Errorf("open secret")
 	}
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return "", err
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	permissions := info.Mode().Perm()
-	ownerOK := ok && (stat.Uid == 0 || stat.Uid == uint32(os.Geteuid()))
-	groupOK := permissions&0o040 == 0 || ok && stat.Gid == uint32(os.Getegid())
-	if !info.Mode().IsRegular() || permissions&0o137 != 0 || !ownerOK || !groupOK || stat.Nlink != 1 {
-		return "", fmt.Errorf("secret file must be regular, singly linked, owned by root or the service user, and mode 0640 or stricter for the service group")
-	}
 	buf, err := io.ReadAll(io.LimitReader(f, maxSecretBytes+1))
 	if err != nil {
 		return "", err
@@ -167,6 +151,32 @@ func readSecret(path string) (string, error) {
 		return "", fmt.Errorf("secret is empty or contains controls/whitespace")
 	}
 	return value, nil
+}
+
+func openProtectedRegular(path, purpose string) (*os.File, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), path)
+	if f == nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("open %s", purpose)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	permissions := info.Mode().Perm()
+	ownerOK := ok && (stat.Uid == 0 || stat.Uid == uint32(os.Geteuid()))
+	groupOK := permissions&0o040 == 0 || ok && stat.Gid == uint32(os.Getegid())
+	if !info.Mode().IsRegular() || permissions&0o137 != 0 || !ownerOK || !groupOK || stat.Nlink != 1 {
+		_ = f.Close()
+		return nil, fmt.Errorf("%s file must be regular, singly linked, owned by root or the service user, and mode 0640 or stricter for the service group", purpose)
+	}
+	return f, nil
 }
 
 func (c Config) String() string {

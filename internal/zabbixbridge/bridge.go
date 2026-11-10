@@ -303,21 +303,24 @@ func New(cfg Config, logger *slog.Logger) (*Daemon, error) {
 }
 func (d *Daemon) Close() error { return d.store.Close() }
 func (d *Daemon) Run(ctx context.Context) error {
+	if d.logger != nil {
+		d.logger.Info("zabbix bridge starting", "gateway_url", d.cfg.GatewayURL, "zabbix_api_url", d.cfg.ZabbixAPIURL, "zabbix_host", d.cfg.ZabbixHost)
+	}
 	poll := time.NewTicker(d.cfg.PollInterval)
 	defer poll.Stop()
 	inventory := time.NewTicker(d.cfg.InventoryInterval)
 	defer inventory.Stop()
-	if err := d.bridge.poll(ctx); err != nil && d.logger != nil {
-		d.logger.Error("zabbix bridge poll failed", "error", err)
-	}
+	pollFailed := false
+	d.logPollResult("zabbix bridge poll", d.bridge.poll(ctx), &pollFailed)
 	for {
 		select {
 		case <-ctx.Done():
+			if d.logger != nil {
+				d.logger.Info("zabbix bridge stopped", "reason", ctx.Err())
+			}
 			return ctx.Err()
 		case <-poll.C:
-			if err := d.bridge.poll(ctx); err != nil && d.logger != nil {
-				d.logger.Error("zabbix bridge poll failed", "error", err)
-			}
+			d.logPollResult("zabbix bridge poll", d.bridge.poll(ctx), &pollFailed)
 		case <-inventory.C:
 			// Drain every replayable transaction before moving the inventory cut.
 			if err := d.bridge.poll(ctx); err != nil {
@@ -329,6 +332,22 @@ func (d *Daemon) Run(ctx context.Context) error {
 			if err := d.bridge.refreshInventory(ctx); err != nil && d.logger != nil {
 				d.logger.Error("zabbix bridge inventory refresh failed", "error", err)
 			}
+		}
+	}
+}
+
+func (d *Daemon) logPollResult(operation string, err error, failed *bool) {
+	if err != nil {
+		*failed = true
+		if d.logger != nil {
+			d.logger.Error(operation+" failed", "error", err)
+		}
+		return
+	}
+	if *failed {
+		*failed = false
+		if d.logger != nil {
+			d.logger.Info(operation + " recovered")
 		}
 	}
 }

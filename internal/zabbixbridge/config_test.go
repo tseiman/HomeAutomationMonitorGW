@@ -30,7 +30,8 @@ func writeConfig(t *testing.T, extra string) string {
 }
 
 func TestLoadConfigDefaultsAndStrictFields(t *testing.T) {
-	cfg, err := loadConfig(writeConfig(t, ""))
+	path := writeConfig(t, "")
+	cfg, err := loadConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,6 +42,22 @@ func TestLoadConfigDefaultsAndStrictFields(t *testing.T) {
 		if _, err := loadConfig(writeConfig(t, extra)); err == nil {
 			t.Fatalf("accepted %q", extra)
 		}
+	}
+	if err := os.Chmod(path, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path); err == nil {
+		t.Fatal("accepted world-writable configuration")
+	}
+}
+
+func TestLoadConfigRejectsHardLinkedConfiguration(t *testing.T) {
+	path := writeConfig(t, "")
+	if err := os.Link(path, path+".other"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfig(path); err == nil {
+		t.Fatal("accepted multiply linked configuration")
 	}
 }
 

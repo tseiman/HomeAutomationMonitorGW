@@ -28,6 +28,7 @@ HomeAutomationMonitorGW is a small, read-only Linux monitoring gateway. It polls
 - [MIB metadata with `mib2json`](#mib-metadata-with-mib2json)
   - [Which MIB files are needed?](#which-mib-files-are-needed)
 - [API and Zabbix](#api-and-zabbix)
+  - [Optional delta bridge](#optional-delta-bridge)
   - [Live gateway status and SSE](#live-gateway-status-and-sse)
   - [WAGO K-bus Visualizer widget](#wago-k-bus-visualizer-widget)
   - [Per-collector health events for Honeycomb](#per-collector-health-events-for-honeycomb)
@@ -643,6 +644,12 @@ metadata_file: "/etc/automation-gateway/wago-750-880-metadata.json"
 > **Compatibility note:** The Zabbix template intentionally retains its historical
 > `HomeAuthMonitorGW` name, filename, group, and internal references so existing
 > installations can be updated without a template migration.
+
+### Optional delta bridge
+
+The separately packaged `automation-gateway-zabbix` service consumes the generic full-snapshot and delta endpoints and writes trapper history through Zabbix `history.push`. Its defaults are a 5-second bridge poll and 15-minute inventory refresh; the gateway metric heartbeat defaults to 5 minutes. It does not alter gateway device polling and has no device access. Constant values generally avoid repeated full-snapshot transfer, while frequently changing values still produce delta traffic and history; Zabbix CPU and database effects must be measured rather than inferred proportionally.
+
+Use the [migration guide](ZABBIX_DELTA_MIGRATION.md) for package installation, protected file modes, API-role and host permissions, frontend-IP `Allowed hosts`, operator-controlled template import, validation, cutover, and rollback. The [architecture note](architecture/zabbix-delta-integration.md) documents cursor commit order, snapshot-only discovery, timestamps, gap handling, and at-least-once delivery limits.
 
 Every endpoint requires both an allowed TCP peer and a bearer token:
 

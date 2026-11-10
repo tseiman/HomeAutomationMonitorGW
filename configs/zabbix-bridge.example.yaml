@@ -1,4 +1,4 @@
-# External Zabbix delta bridge; token files must be regular mode-0600 files.
+# External Zabbix delta bridge; credentials must be root:automation-gateway-zabbix mode 0640, or service-owned mode 0600.
 gateway_url: https://gateway.example.invalid
 gateway_ca_file: /etc/automation-gateway-zabbix/gateway-ca.pem
 gateway_token_file: /etc/automation-gateway-zabbix/gateway.token

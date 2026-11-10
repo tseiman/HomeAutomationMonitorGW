@@ -1,14 +1,53 @@
 package zabbixbridge
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestDaemonLogsFailureRecoveryAndStopWithoutSecrets(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	g := &recoveringGateway{failures: 1}
+	b := bridge{gateway: g, zabbix: &recordingPusher{}, state: &memoryState{}, host: "host", batchSize: 100, maxPages: 10}
+	d := &Daemon{cfg: Config{GatewayURL: "https://gateway.invalid", ZabbixAPIURL: "https://zabbix.invalid/api_jsonrpc.php", ZabbixHost: "host", PollInterval: time.Millisecond, InventoryInterval: time.Hour, gatewayToken: "gateway-secret", zabbixToken: "zabbix-secret"}, bridge: b, logger: logger}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
+	defer cancel()
+	_ = d.Run(ctx)
+	text := logs.String()
+	for _, want := range []string{"zabbix bridge starting", "zabbix bridge poll failed", "zabbix bridge poll recovered", "zabbix bridge stopped", "https://gateway.invalid", "host"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("logs lack %q: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "gateway-secret") || strings.Contains(text, "zabbix-secret") {
+		t.Fatalf("secret leaked: %s", text)
+	}
+	if strings.Count(text, "poll recovered") != 1 {
+		t.Fatalf("recovery logged repeatedly: %s", text)
+	}
+}
+
+type recoveringGateway struct{ failures int }
+
+func (g *recoveringGateway) full(context.Context) (fullResponse, error) {
+	if g.failures > 0 {
+		g.failures--
+		return fullResponse{}, fmt.Errorf("temporary failure")
+	}
+	return fullResponse{SchemaVersion: 1, Generation: "AAAAAAAAAAAAAAAAAAAAAA", Cursor: "v1.AAAAAAAAAAAAAAAAAAAAAA.1", CapturedAt: time.Now(), Sources: []snapshot{}}, nil
+}
+func (g *recoveringGateway) delta(_ context.Context, cursor string) (deltaResponse, int, error) {
+	return deltaResponse{SchemaVersion: 1, FromCursor: cursor, NextCursor: cursor, HeadCursor: cursor, Transactions: []transaction{}}, 200, nil
+}
 
 type fakeGateway struct {
 	fulls                 []fullResponse
