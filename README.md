@@ -463,10 +463,13 @@ A specific `.deb` and its adjacent checksum can still be downloaded from a GitHu
 This is a one-time repository-administrator operation. The private signing key must never be committed. Keep the private export in an offline backup: GitHub Actions secrets can be replaced but cannot be read back after saving.
 
 1. Open the GitHub repository and select **Settings → Secrets and variables → Actions**.
-2. Select **New repository secret**.
-3. Set the name to `APT_SIGNING_PRIVATE_KEY`.
-4. Paste the complete private ASCII-armored key, including its `BEGIN` and `END` lines, and save it.
-5. Open **Settings → Pages** and select **GitHub Actions** as the build and deployment source.
+2. In the **Repository secrets** section—not **Environment secrets**, **Environment variables**, or **Repository variables**—select **New repository secret**.
+3. Set **Name** to exactly `APT_SIGNING_PRIVATE_KEY`.
+4. Open the downloaded `homeautomationmonitorgw-archive-private-key.asc` as text, copy its complete ASCII-armored contents including the `-----BEGIN PGP PRIVATE KEY BLOCK-----` and `-----END PGP PRIVATE KEY BLOCK-----` lines into **Secret**, and select **Add secret**.
+5. Confirm that `APT_SIGNING_PRIVATE_KEY` is listed under **Repository secrets**. GitHub will not display its value again.
+6. Open **Settings → Pages → Build and deployment**, set **Source** to **GitHub Actions**, and save if GitHub presents a save button.
+
+Do not create an environment-scoped secret for this workflow: the signing job does not target an environment, so it reads only the repository secret. The separate `github-pages` environment is used by the later deployment job and does not need the private key.
 
 The committed public key is [`packaging/apt/homeautomationmonitorgw-archive-key.asc`](packaging/apt/homeautomationmonitorgw-archive-key.asc). Its pinned fingerprint is:
 
