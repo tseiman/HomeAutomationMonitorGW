@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
+
 	"testing"
 	"time"
 )
@@ -16,35 +16,6 @@ func tlsPool(t *testing.T, server *httptest.Server) *x509.CertPool {
 	pool := x509.NewCertPool()
 	pool.AddCert(server.Certificate())
 	return pool
-}
-
-func TestGatewayClientUsesBearerTLSStrictSchemaAndBoundedBodies(t *testing.T) {
-	seenAuth := ""
-	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenAuth = r.Header.Get("Authorization")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"schema_version":1,"generation":"AAAAAAAAAAAAAAAAAAAAAA","cursor":"v1.AAAAAAAAAAAAAAAAAAAAAA.0","captured_at":"2026-11-10T12:00:00Z","sources":[]}`))
-	}))
-	defer s.Close()
-	c := newHTTPClient(tlsPool(t, s), time.Second)
-	g := gatewayClient{baseURL: s.URL, token: "top-secret-token", client: c, maxBody: 1024}
-	if _, err := g.full(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if seenAuth != "Bearer top-secret-token" {
-		t.Fatalf("auth=%q", seenAuth)
-	}
-
-	s.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"schema_version":1,"unknown":true}`))
-	})
-	if _, err := g.full(context.Background()); err == nil || strings.Contains(err.Error(), "top-secret-token") {
-		t.Fatalf("strict/redacted err=%v", err)
-	}
-	s.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(make([]byte, 1025)) })
-	if _, err := g.full(context.Background()); err == nil {
-		t.Fatal("accepted oversized body")
-	}
 }
 
 func TestZabbixHistoryPushRejectsPartialOrMalformedResults(t *testing.T) {

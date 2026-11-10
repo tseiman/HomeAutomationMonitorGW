@@ -59,7 +59,7 @@ zabbix_export:
               expression: 'nodata(/Template HomeAuthMonitorGW by HTTP/automation.gateway.snapshot,5m)=1'
               name: 'Automation gateway has no snapshot data for 5 minutes'
               priority: HIGH
-              description: 'The external bridge has submitted no complete inventory snapshot for five minutes. Check both HTTPS trust/authentication paths, trapper allowed hosts, bridge state, and service availability.'
+              description: 'The built-in automation-gateway Zabbix worker has submitted no complete inventory snapshot for five minutes. Check the Zabbix API trust/token settings, trapper allowed hosts, cursor state, and gateway service availability.'
         - uuid: 1e0f1d2b76894e31ad44529eb2f21f4d
           name: 'TS Service health: HeimAuto'
           type: DEPENDENT
@@ -1160,7 +1160,10 @@ zabbix_export:
                           }
                           var metricID = metric.name;
                           var selector = '@.name == ' + JSON.stringify(metric.name);
-                          if (metric.labels && typeof metric.labels.oid === 'string') {
+                          if (typeof metric.identity === 'string' && metric.identity !== '') {
+                              metricID = metric.identity;
+                              selector = '@.identity == ' + JSON.stringify(metric.identity);
+                          } else if (metric.labels && typeof metric.labels.oid === 'string') {
                               metricID = metric.labels.oid;
                               selector = '@.labels.oid == ' + JSON.stringify(metric.labels.oid);
                           }
@@ -1275,7 +1278,10 @@ zabbix_export:
                           }
                           var metricID = metric.name;
                           var selector = '@.name == ' + JSON.stringify(metric.name);
-                          if (metric.labels && typeof metric.labels.oid === 'string') {
+                          if (typeof metric.identity === 'string' && metric.identity !== '') {
+                              metricID = metric.identity;
+                              selector = '@.identity == ' + JSON.stringify(metric.identity);
+                          } else if (metric.labels && typeof metric.labels.oid === 'string') {
                               metricID = metric.labels.oid;
                               selector = '@.labels.oid == ' + JSON.stringify(metric.labels.oid);
                           }
@@ -1313,10 +1319,7 @@ zabbix_export:
       macros:
         - macro: '{$AUTOMATION_GATEWAY_ALLOWED_HOSTS}'
           value: '127.0.0.1'
-          description: 'Comma-delimited Zabbix bridge or frontend addresses allowed to submit trapper values. Override at host scope for a remote bridge.'
-        - macro: '{$AUTOMATION_GATEWAY_INTERVAL}'
-          value: '15m'
-          description: 'Inventory cadence for complete snapshots submitted by the external bridge; configure the daemon to match.'
+          description: 'Comma-delimited Zabbix frontend addresses allowed to submit trapper values. history.push originates from the frontend, even when automation-gateway runs remotely.'
         - macro: '{$WAGO_SOURCE}'
           value: 'wago-750-880-snmp3'
           description: 'Gateway source name used by the WAGO core items and dashboard.'

@@ -7,28 +7,95 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tseiman/HomeAutomationMonitorGW/internal/cache"
+	"github.com/tseiman/HomeAutomationMonitorGW/internal/metrics"
 )
+
+func TestStoreGatewayBootstrapsAndReplaysDirectly(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
+	store := cache.New(func() time.Time { return now })
+	store.Register("source", "nut", time.Minute)
+	identity := "native:input.voltage"
+	if err := store.Success("source", []metrics.Metric{{Identity: identity, Name: "voltage", Value: 24.5, ValueType: "number", Timestamp: now}}, time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	state := &memoryState{}
+	pusher := &recordingPusher{}
+	worker := bridge{gateway: storeGateway{store}, zabbix: pusher, state: state, host: "host", batchSize: 100, maxPages: 10}
+	if err := worker.poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first := state.cursor
+	if first == "" || len(pusher.batches) < 2 {
+		t.Fatalf("bootstrap cursor=%q batches=%d", first, len(pusher.batches))
+	}
+	wantKey := fmt.Sprintf(`automation.gateway.metric.numeric["source","%s"]`, metricKey(identity))
+	if got := pusher.batches[1][0].Key; got != wantKey {
+		t.Fatalf("bootstrap key=%q want stable identity key %q", got, wantKey)
+	}
+	now = now.Add(time.Second)
+	if err := store.Success("source", []metrics.Metric{{Identity: identity, Name: "voltage", Value: 25.0, ValueType: "number", Timestamp: now}}, time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if state.cursor == first {
+		t.Fatal("delta cursor did not advance")
+	}
+	if got := pusher.batches[len(pusher.batches)-1][0].Key; got != wantKey {
+		t.Fatalf("delta key=%q want stable identity key %q", got, wantKey)
+	}
+}
+
+func TestCheckDoesNotCreateMissingCursorParent(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "not-created")
+	cfg := Config{CursorStatePath: filepath.Join(parent, "cursor")}
+	if err := Check(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(parent); !os.IsNotExist(err) {
+		t.Fatalf("Check created or touched cursor parent: %v", err)
+	}
+}
+
+func TestStoreGatewayResynchronizesOnlyGenerationAndExpiredCursors(t *testing.T) {
+	store := cache.New(time.Now)
+	gateway := storeGateway{store}
+	_, code, err := gateway.delta(context.Background(), "malformed")
+	if err == nil || code != 0 {
+		t.Fatalf("malformed cursor code=%d err=%v", code, err)
+	}
+	other := cache.New(time.Now).Cursor()
+	_, code, err = gateway.delta(context.Background(), other)
+	if !errors.Is(err, cache.ErrCursorGeneration) || code != 409 {
+		t.Fatalf("generation cursor code=%d err=%v", code, err)
+	}
+}
 
 func TestDaemonLogsFailureRecoveryAndStopWithoutSecrets(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 	g := &recoveringGateway{failures: 1}
 	b := bridge{gateway: g, zabbix: &recordingPusher{}, state: &memoryState{}, host: "host", batchSize: 100, maxPages: 10}
-	d := &Daemon{cfg: Config{GatewayURL: "https://gateway.invalid", ZabbixAPIURL: "https://zabbix.invalid/api_jsonrpc.php", ZabbixHost: "host", PollInterval: time.Millisecond, InventoryInterval: time.Hour, gatewayToken: "gateway-secret", zabbixToken: "zabbix-secret"}, bridge: b, logger: logger}
+	d := &Daemon{cfg: Config{ZabbixAPIURL: "https://zabbix.invalid/api_jsonrpc.php", ZabbixHost: "host", PollInterval: time.Millisecond, InventoryInterval: time.Hour, Token: "zabbix-secret"}, bridge: b, logger: logger}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
 	defer cancel()
 	_ = d.Run(ctx)
 	text := logs.String()
-	for _, want := range []string{"zabbix bridge starting", "zabbix bridge poll failed", "zabbix bridge poll recovered", "zabbix bridge stopped", "https://gateway.invalid", "host"} {
+	for _, want := range []string{"zabbix worker starting", "zabbix bridge poll failed", "zabbix bridge poll recovered", "zabbix worker stopped", "https://zabbix.invalid", "host"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("logs lack %q: %s", want, text)
 		}
 	}
-	if strings.Contains(text, "gateway-secret") || strings.Contains(text, "zabbix-secret") {
+	if strings.Contains(text, "zabbix-secret") {
 		t.Fatalf("secret leaked: %s", text)
 	}
 	if strings.Count(text, "poll recovered") != 1 {

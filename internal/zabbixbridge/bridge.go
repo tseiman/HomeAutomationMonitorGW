@@ -4,15 +4,17 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"net/http"
 	"regexp"
 	"strconv"
-	"strings"
 	"time"
 	"unicode/utf16"
+
+	"github.com/tseiman/HomeAutomationMonitorGW/internal/cache"
 )
 
 var cursorPattern = regexp.MustCompile(`^v1\.[A-Za-z0-9_-]{22}\.(0|[1-9][0-9]*)$`)
@@ -21,6 +23,57 @@ type gatewayAPI interface {
 	full(context.Context) (fullResponse, error)
 	delta(context.Context, string) (deltaResponse, int, error)
 }
+
+type storeGateway struct{ store *cache.Store }
+
+func convertStrict(input, output any) error {
+	data, err := json.Marshal(input)
+	if err != nil {
+		return err
+	}
+	return strictDecode(data, output)
+}
+
+func (g storeGateway) full(context.Context) (fullResponse, error) {
+	value := g.store.Full()
+	var response fullResponse
+	if err := convertStrict(value, &response); err != nil {
+		return fullResponse{}, fmt.Errorf("convert store full response: %w", err)
+	}
+	for sourceIndex := range value.Sources {
+		for metricIndex := range value.Sources[sourceIndex].Metrics {
+			response.Sources[sourceIndex].Metrics[metricIndex].Identity = value.Sources[sourceIndex].Metrics[metricIndex].Identity
+		}
+	}
+	return response, nil
+}
+
+func (g storeGateway) delta(_ context.Context, cursor string) (deltaResponse, int, error) {
+	value, err := g.store.Delta(cursor)
+	if err != nil {
+		switch {
+		case errors.Is(err, cache.ErrCursorGeneration):
+			return deltaResponse{}, http.StatusConflict, err
+		case errors.Is(err, cache.ErrCursorExpired):
+			return deltaResponse{}, http.StatusGone, err
+		default:
+			return deltaResponse{}, 0, err
+		}
+	}
+	var response deltaResponse
+	if err := convertStrict(value, &response); err != nil {
+		return deltaResponse{}, 0, fmt.Errorf("convert store delta response: %w", err)
+	}
+	for transactionIndex := range value.Transactions {
+		for metricIndex := range value.Transactions[transactionIndex].Metrics {
+			if response.Transactions[transactionIndex].Metrics[metricIndex].Metric != nil {
+				response.Transactions[transactionIndex].Metrics[metricIndex].Metric.Identity = value.Transactions[transactionIndex].Metrics[metricIndex].Identity
+			}
+		}
+	}
+	return response, http.StatusOK, nil
+}
+
 type historyPusher interface {
 	push(context.Context, []historyValue) error
 }
@@ -212,8 +265,11 @@ func metricHistory(source, host string, m metric) (historyValue, error) {
 	if source == "" || m.Name == "" || m.Timestamp.IsZero() {
 		return historyValue{}, fmt.Errorf("invalid metric schema")
 	}
-	identity := m.Name
-	if oid := m.Labels["oid"]; oid != "" {
+	identity := m.Identity
+	if identity == "" {
+		identity = m.Name
+	}
+	if oid := m.Labels["oid"]; identity == m.Name && oid != "" {
 		identity = oid
 	}
 	family := ""
@@ -284,10 +340,17 @@ type Daemon struct {
 	logger *slog.Logger
 }
 
-func New(cfg Config, logger *slog.Logger) (*Daemon, error) {
-	gr, err := rootsFor(cfg.GatewayCAFile)
-	if err != nil {
-		return nil, fmt.Errorf("gateway CA: %w", err)
+// Check validates CA material and secure cursor-state access without starting a worker.
+func Check(cfg Config) error {
+	if _, err := rootsFor(cfg.ZabbixCAFile); err != nil {
+		return fmt.Errorf("zabbix CA: %w", err)
+	}
+	return checkCursorPath(cfg.CursorStatePath)
+}
+
+func New(cfg Config, source *cache.Store, logger *slog.Logger) (*Daemon, error) {
+	if source == nil {
+		return nil, fmt.Errorf("cache store is required")
 	}
 	zr, err := rootsFor(cfg.ZabbixCAFile)
 	if err != nil {
@@ -297,14 +360,13 @@ func New(cfg Config, logger *slog.Logger) (*Daemon, error) {
 	if err != nil {
 		return nil, err
 	}
-	g := gatewayClient{baseURL: strings.TrimSuffix(cfg.GatewayURL, "/"), token: cfg.gatewayToken, client: newHTTPClient(gr, cfg.RequestTimeout), maxBody: cfg.MaxResponseBytes}
-	z := zabbixClient{url: cfg.ZabbixAPIURL, token: cfg.zabbixToken, client: newHTTPClient(zr, cfg.RequestTimeout), maxBody: cfg.MaxResponseBytes}
-	return &Daemon{cfg: cfg, store: store, logger: logger, bridge: bridge{gateway: g, zabbix: z, state: store, host: cfg.ZabbixHost, batchSize: cfg.BatchSize, maxPages: cfg.MaxPages}}, nil
+	z := zabbixClient{url: cfg.ZabbixAPIURL, token: cfg.Token, client: newHTTPClient(zr, cfg.RequestTimeout), maxBody: cfg.MaxResponseBytes}
+	return &Daemon{cfg: cfg, store: store, logger: logger, bridge: bridge{gateway: storeGateway{source}, zabbix: z, state: store, host: cfg.ZabbixHost, batchSize: cfg.BatchSize, maxPages: cfg.MaxPages}}, nil
 }
 func (d *Daemon) Close() error { return d.store.Close() }
 func (d *Daemon) Run(ctx context.Context) error {
 	if d.logger != nil {
-		d.logger.Info("zabbix bridge starting", "gateway_url", d.cfg.GatewayURL, "zabbix_api_url", d.cfg.ZabbixAPIURL, "zabbix_host", d.cfg.ZabbixHost)
+		d.logger.Info("zabbix worker starting", "zabbix_api_url", d.cfg.ZabbixAPIURL, "zabbix_host", d.cfg.ZabbixHost)
 	}
 	poll := time.NewTicker(d.cfg.PollInterval)
 	defer poll.Stop()
@@ -316,7 +378,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			if d.logger != nil {
-				d.logger.Info("zabbix bridge stopped", "reason", ctx.Err())
+				d.logger.Info("zabbix worker stopped", "reason", ctx.Err())
 			}
 			return ctx.Err()
 		case <-poll.C:

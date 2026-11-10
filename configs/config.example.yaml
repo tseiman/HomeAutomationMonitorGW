@@ -23,10 +23,26 @@ authentication:
 # In-memory delta replay. All limits are strict and reloadable; a successful
 # reload creates a new cursor generation, so readers must take a new full snapshot.
 delta:
-  heartbeat: "5m"          # unchanged metrics are repeated at this interval (1s-24h)
+  heartbeat: "5m"          # unchanged metrics are repeated at this interval (5s-24h)
   retention_age: "30m"     # replay age window (1m-24h)
   max_events: 10000        # whole poll transactions (1-1000000)
   max_bytes: 67108864      # approximate encoded journal bytes (1KiB-1GiB)
+
+# Optional built-in Zabbix history.push forwarding. When disabled, no Zabbix
+# token, network connection, cursor file, or worker is opened.
+zabbix:
+  enabled: false
+  api_url: "https://zabbix.example.invalid/api_jsonrpc.php"
+  ca_file: "/etc/automation-gateway/zabbix-ca.pem" # optional; system roots are used when empty
+  token_file: "/etc/automation-gateway/tokens/zabbix-api"
+  host: "automation-gateway"
+  poll_interval: "5s"
+  inventory_interval: "15m"
+  request_timeout: "10s"
+  cursor_state_path: "/var/lib/automation-gateway/zabbix-cursor"
+  batch_size: 100
+  max_pages: 100
+  max_response_bytes: 8388608
 
 logging:
   level: "info"

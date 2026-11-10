@@ -10,7 +10,7 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"net/url"
+
 	"os"
 	"strconv"
 	"strings"
@@ -182,52 +182,6 @@ func readBounded(resp *http.Response, max int64) ([]byte, error) {
 	return body, nil
 }
 
-type gatewayClient struct {
-	baseURL, token string
-	client         *http.Client
-	maxBody        int64
-}
-
-func (g gatewayClient) get(ctx context.Context, path string, out any) (int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.baseURL+path, nil)
-	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("Authorization", "Bearer "+g.token)
-	req.Header.Set("Accept", "application/json")
-	resp, err := g.client.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("gateway request: %w", err)
-	}
-	body, err := readBounded(resp, g.maxBody)
-	if err != nil {
-		return resp.StatusCode, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return resp.StatusCode, fmt.Errorf("gateway returned HTTP %d", resp.StatusCode)
-	}
-	if err := strictDecode(body, out); err != nil {
-		return resp.StatusCode, fmt.Errorf("decode gateway response: %w", err)
-	}
-	return resp.StatusCode, nil
-}
-func (g gatewayClient) full(ctx context.Context) (fullResponse, error) {
-	var out fullResponse
-	_, err := g.get(ctx, "/api/v1/metrics/all", &out)
-	if err == nil {
-		err = validateFull(out)
-	}
-	return out, err
-}
-func (g gatewayClient) delta(ctx context.Context, cursor string) (deltaResponse, int, error) {
-	var out deltaResponse
-	path := "/api/v1/metrics/delta?since=" + url.QueryEscape(cursor)
-	code, err := g.get(ctx, path, &out)
-	if err == nil {
-		err = validateDelta(out, cursor)
-	}
-	return out, code, err
-}
 func validateFull(v fullResponse) error {
 	parts := strings.Split(v.Cursor, ".")
 	if v.SchemaVersion != 1 || v.Generation == "" || !cursorPattern.MatchString(v.Cursor) || len(parts) != 3 || parts[1] != v.Generation || v.CapturedAt.IsZero() || v.Sources == nil {

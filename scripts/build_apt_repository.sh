@@ -46,7 +46,7 @@ for package_path in "${packages[@]}"; do
     version="$(dpkg-deb -f "$package_path" Version)"
     architecture="$(dpkg-deb -f "$package_path" Architecture)"
     case "$package_name" in
-        automation-gateway|automation-gateway-led|automation-gateway-zabbix) ;;
+        automation-gateway|automation-gateway-led) ;;
         *) echo "unexpected package name: $package_name" >&2; exit 1 ;;
     esac
     case "$architecture" in

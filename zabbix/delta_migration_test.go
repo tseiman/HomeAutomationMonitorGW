@@ -40,8 +40,16 @@ func TestDeltaBridgeTemplateMigration(t *testing.T) {
 	for _, m := range template.Macros {
 		macros[m.Macro] = m.Value
 	}
-	if macros["{$AUTOMATION_GATEWAY_ALLOWED_HOSTS}"] != "127.0.0.1" || macros["{$AUTOMATION_GATEWAY_INTERVAL}"] != "15m" {
+	if macros["{$AUTOMATION_GATEWAY_ALLOWED_HOSTS}"] != "127.0.0.1" {
 		t.Fatalf("macros=%v", macros)
+	}
+	for _, retired := range []string{"{$AUTOMATION_GATEWAY_URL}", "{$AUTOMATION_GATEWAY_TOKEN}", "{$AUTOMATION_GATEWAY_TIMEOUT}", "{$AUTOMATION_GATEWAY_INTERVAL}"} {
+		if _, ok := macros[retired]; ok {
+			t.Fatalf("retired HTTP/bridge macro remains: %s", retired)
+		}
+	}
+	if strings.Contains(string(data), "external bridge") || strings.Contains(string(data), "remote bridge") {
+		t.Fatal("template still describes the removed external bridge")
 	}
 	for _, rule := range template.DiscoveryRules {
 		if rule.Type != "DEPENDENT" || rule.MasterItem.Key != "automation.gateway.snapshot" {
@@ -87,6 +95,9 @@ func TestDeltaBridgeTemplateMigration(t *testing.T) {
 				t.Fatalf("delta JSONPath in LLD: %+v", step)
 			}
 		}
+	}
+	if strings.Count(string(data), "typeof metric.identity === 'string' && metric.identity !== ''") < 2 || strings.Count(string(data), "@.identity == ") < 2 {
+		t.Fatal("metric discovery does not prefer the gateway stable identity")
 	}
 	if !strings.Contains(string(data), "metric.value_type !== 'boolean'") {
 		t.Fatal("numeric discovery excludes supported boolean metrics")

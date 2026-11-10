@@ -27,6 +27,7 @@ import (
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/metrics"
 	statusmodel "github.com/tseiman/HomeAutomationMonitorGW/internal/status"
 	"github.com/tseiman/HomeAutomationMonitorGW/internal/tlsreload"
+	"github.com/tseiman/HomeAutomationMonitorGW/internal/zabbixbridge"
 )
 
 type sourceSpec struct {
@@ -139,8 +140,21 @@ func newFilesWithDependencies(paths []string, logger *slog.Logger, deps dependen
 	active := buildGeneration(cand.cfg, cand.cert, cand.specs, nil)
 	runtime.active.Store(active)
 	runtime.resources = cand.resources
-	runtime.start(cand.specs, active.store, active.status)
+	if err := runtime.start(cand.specs, active.store, active.status, cand.cfg); err != nil {
+		_ = closeResources(runtime.resources)
+		return nil, err
+	}
 	return runtime, nil
+}
+
+func zabbixConfig(cfg config.Config) zabbixbridge.Config {
+	return zabbixbridge.Config{
+		ZabbixAPIURL: cfg.Zabbix.APIURL, ZabbixCAFile: cfg.Zabbix.CAFile, ZabbixHost: cfg.Zabbix.Host,
+		PollInterval: cfg.Zabbix.PollInterval.Duration, InventoryInterval: cfg.Zabbix.InventoryInterval.Duration,
+		RequestTimeout: cfg.Zabbix.RequestTimeout.Duration, CursorStatePath: cfg.Zabbix.CursorStatePath,
+		BatchSize: cfg.Zabbix.BatchSize, MaxPages: cfg.Zabbix.MaxPages, MaxResponseBytes: cfg.Zabbix.MaxResponseBytes,
+		Token: cfg.Secrets.ZabbixToken,
+	}
 }
 
 // prepare loads path and builds a complete inactive candidate before active runtime state can change.
@@ -160,6 +174,12 @@ func prepareWithDependencies(paths []string, deps dependencies) (candidate, erro
 	prepared, err := prepareSourcesWithDependencies(cfg, deps)
 	if err != nil {
 		return candidate{}, err
+	}
+	if cfg.Zabbix.Enabled {
+		if err := zabbixbridge.Check(zabbixConfig(cfg)); err != nil {
+			_ = prepared.close()
+			return candidate{}, fmt.Errorf("zabbix worker: %w", err)
+		}
 	}
 	return candidate{cfg: cfg, cert: cert, specs: prepared.specs, resources: prepared.resources}, nil
 }
@@ -336,7 +356,9 @@ func (r *Runtime) Reload() error {
 	// This single store prevents new credentials from ever observing an old or partially registered cache.
 	r.active.Store(next)
 	r.resources = cand.resources
-	r.startLocked(cand.specs, next.store, next.status)
+	if err := r.startLocked(cand.specs, next.store, next.status, cand.cfg); err != nil {
+		return fmt.Errorf("start replacement generation: %w", err)
+	}
 	return nil
 }
 
@@ -355,16 +377,23 @@ func reloadCompatible(a, b config.Config) bool {
 }
 
 // start acquires the runtime lock and starts the supplied collectors against store.
-func (r *Runtime) start(specs []sourceSpec, store *cache.Store, observer drivers.PollObserver) {
+func (r *Runtime) start(specs []sourceSpec, store *cache.Store, observer drivers.PollObserver, cfg config.Config) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.startLocked(specs, store, observer)
+	return r.startLocked(specs, store, observer, cfg)
 }
 
-// startLocked launches polling and optional discovery against an already complete generation store.
-func (r *Runtime) startLocked(specs []sourceSpec, store *cache.Store, observer drivers.PollObserver) {
+// startLocked launches polling, optional discovery, and the optional Zabbix worker.
+func (r *Runtime) startLocked(specs []sourceSpec, store *cache.Store, observer drivers.PollObserver, cfg config.Config) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
+	if cfg.Zabbix.Enabled {
+		r.wg.Add(1)
+		go func() {
+			defer r.wg.Done()
+			r.runZabbixWorker(ctx, zabbixConfig(cfg), store)
+		}()
+	}
 	for _, spec := range specs {
 		r.wg.Add(1)
 		go func(spec sourceSpec) {
@@ -386,6 +415,48 @@ func (r *Runtime) startLocked(specs []sourceSpec, store *cache.Store, observer d
 				}
 				store.SetDiscovery(spec.name, definitions)
 			}(spec)
+		}
+	}
+	return nil
+}
+
+// runZabbixWorker supervises local-state acquisition independently of collectors.
+// A missing or externally locked cursor cannot prevent the gateway generation
+// from polling devices and serving its cache; the worker retries without log spam.
+func (r *Runtime) runZabbixWorker(ctx context.Context, cfg zabbixbridge.Config, store *cache.Store) {
+	failed := false
+	for {
+		worker, err := zabbixbridge.New(cfg, store, r.logger)
+		if err == nil {
+			if failed && r.logger != nil {
+				r.logger.Info("zabbix worker initialization recovered")
+			}
+			failed = false
+			runErr := worker.Run(ctx)
+			closeErr := worker.Close()
+			if ctx.Err() != nil {
+				if closeErr != nil && r.logger != nil {
+					r.logger.Warn("zabbix worker cleanup failed", "error", closeErr)
+				}
+				return
+			}
+			err = errors.Join(runErr, closeErr)
+		}
+		if !failed && r.logger != nil {
+			r.logger.Error("zabbix worker initialization failed", "error", err)
+		}
+		failed = true
+		timer := time.NewTimer(cfg.PollInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case <-timer.C:
 		}
 	}
 }

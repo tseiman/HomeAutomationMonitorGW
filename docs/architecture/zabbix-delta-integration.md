@@ -4,52 +4,47 @@
 
 ```text
 NUT / SNMPv3 / Modbus RTU
-          │ fixed gateway polls
+          │ read-only collector polls
           ▼
-Gateway cache + bounded transaction journal
-          │ HTTPS: /api/v1/metrics/all and /api/v1/metrics/delta
+automation-gateway cache + bounded transaction journal
+          │ direct in-process Store.Full / Store.Delta adapter
           ▼
-automation-gateway-zabbix
+optional automation-gateway Zabbix worker
           │ HTTPS JSON-RPC: history.push
           ▼
 Zabbix trapper items and history
 ```
 
-The bridge is a network-only consumer. It neither opens device nodes nor changes the gateway polling schedule. It authenticates separately to the gateway and Zabbix API and sends values to pre-created trapper items on one configured Zabbix host.
+The worker is part of the standard process, package, account, configuration, and systemd lifecycle. It never polls a device through HTTP and needs no gateway URL or gateway token. The authenticated `/api/v1/metrics/all` and `/api/v1/metrics/delta?since=<cursor>` routes remain available to external consumers.
+
+## Lifecycle
+
+When disabled, the gateway does not load a Zabbix token, validate/open Zabbix-specific CA or cursor state, create a worker, or make Zabbix requests. When enabled, candidate configuration and protected files are validated before the active runtime is stopped. The worker starts under the same generation context as collectors. Reload and shutdown cancel it, wait for it, then close its cursor lock/resources.
+
+Each cache generation has a new cursor identity. Therefore a newly started replacement worker naturally bootstraps from the active store. Zabbix polling errors are logged and retried without terminating collectors or the HTTPS server.
 
 ## Replay and cursor commit order
 
-On first use, after a runtime-generation change, or after an expired cursor, the bridge reads `/api/v1/metrics/all`. It pushes the snapshot item first, pushes the snapshot's metric and source-health values, and only then commits the returned cursor. During normal replay it processes journal transactions in order. For each transaction it:
+On first use, after a runtime-generation change, or after an expired cursor, the worker calls `Store.Full`. It pushes the snapshot item first, pushes snapshot metric and source-health values, and commits the returned cursor only after all pushes succeed. During normal replay it calls `Store.Delta` and processes journal transactions in order:
 
-1. derives generic history keys and preserves the metric or transaction timestamp;
-2. completes every `history.push` batch;
-3. atomically persists that transaction's cursor under `/var/lib/automation-gateway-zabbix`.
+1. derive generic history keys while preserving metric/transaction timestamps;
+2. complete every `history.push` batch;
+3. atomically persist that transaction's cursor at the configured path (default `/var/lib/automation-gateway/zabbix-cursor`).
 
-A failed or ambiguous push never advances the cursor. A restart therefore retries the transaction. This is **at-least-once delivery**, not exactly-once delivery: a request may have reached Zabbix even when its response was lost, so retries can submit the same `(host, key, clock, ns, value)` again. Zabbix behavior and retention determine whether a repeated submission is coalesced or stored again; operators must not assume deduplication.
+Failed or ambiguous pushes never advance the cursor, so restart/retry provides **at-least-once delivery**, not exactly-once delivery. Zabbix may receive a duplicate `(host, key, clock, ns, value)` after an ambiguous response; operators must not assume deduplication.
+
+Wrong-generation and expired cursors request bootstrap/resynchronization. Malformed and future cursors fail closed. Non-progressing pages and unexplained schema/sequence errors also fail closed.
 
 ## Snapshot-only discovery
 
-Low-level discovery and dependent inventory items use only the complete `automation.gateway.snapshot` value. The bridge refreshes that snapshot every 15 minutes by default, after first draining replayable deltas, and does not move the replay cursor during the inventory refresh. Delta transactions carry metric and health history, not a partial discovery document.
+Low-level discovery and dependent inventory items use only the complete `automation.gateway.snapshot`. The worker refreshes that snapshot every 15 minutes by default after draining replayable deltas, without moving the replay cursor. Delta transactions carry metric and health history, not partial discovery documents.
 
-The mapping is generic. Numeric, boolean, text, and hexadecimal values are selected by schema metadata and stable identities; no device class, source name, OID family, or vendor model is hardcoded into the bridge.
+The mapping is generic. Numeric, boolean, text, and hexadecimal values are selected by schema metadata and stable identities; no device class, source name, OID family, or vendor model is hardcoded.
 
-## Retries, gaps, and timestamps
+## Timing, logs, and load
 
-The default bridge poll interval is 5 seconds. The gateway's default metric heartbeat is 5 minutes, and the bridge's default inventory refresh is 15 minutes.
+Defaults are a 5-second delta poll, 15-minute inventory refresh, 10-second request timeout, and the gateway's 5-minute unchanged-value heartbeat. Metric timestamps come from the metric; source-health records use transaction capture time; inventory uses full-snapshot capture time.
 
-- Transport, authentication, schema, and Zabbix API failures are logged and retried on a later poll without cursor advancement.
-- A malformed local cursor fails closed.
-- A wrong-generation or pruned gateway cursor triggers a new complete snapshot; an unexplained sequence gap or non-progressing page fails closed rather than skipping data.
-- Metric timestamps come from the gateway metric. Source-health records use the transaction capture time. Snapshot inventory uses the full-snapshot capture time.
-- The bridge logs recovery once after a failed polling period; it does not emit a success message every 5 seconds.
+Startup, recovery, and shutdown logs identify only the Zabbix endpoint/host. Tokens are excluded, and successful polls do not create five-second log spam.
 
-## Expected load characteristics
-
-The table compares the legacy HTTP/dependent-item path with the delta bridge. Actual payload and write counts depend on source count, metric sizes, heartbeats, failures, and Zabbix preprocessing. CPU impact must be measured on the deployed Zabbix server and database; no proportional CPU reduction is implied.
-
-| Value behavior | Gateway device poll traffic | Legacy HTTP/API network payload | Delta bridge network payload | Legacy Zabbix history rows/writes | Delta bridge history rows/writes | Discovery cadence | Processing effort |
-|---|---|---|---|---|---|---|---|
-| Constant value | Unchanged; configured collectors still poll, commonly every 5s | Complete master snapshot on every Zabbix interval | Initial value, then gateway heartbeat (default 5m), plus protocol overhead | Dependent-item evaluation each master fetch; storage follows item/history policy | Initial row and heartbeat submissions; exact database writes depend on Zabbix | Complete snapshot only, default 15m | Less repeated JSON transfer and preprocessing is expected; measure Zabbix CPU |
-| Frequently changing value | Unchanged; configured collectors still poll, commonly every 5s | Complete master snapshot on every Zabbix interval | Changed transaction records, polled by bridge every 5s | Dependent-item evaluation each master fetch; changing values commonly create history | Changed values commonly create history, potentially near collector cadence | Complete snapshot only, default 15m | Delta parsing and `history.push` batching replace repeated full-snapshot dependent processing; measure Zabbix CPU |
-
-The bridge reduces repeated full-snapshot transfer for constant metrics. It cannot reduce device polling traffic, and frequently changing values still require network transfer and history processing.
+Delta forwarding reduces repeated full-snapshot transfer for constant metrics. It does not reduce configured device polling, and frequently changing values still require network transfer and Zabbix history processing. Measure frontend, server, and database effects in the target environment.

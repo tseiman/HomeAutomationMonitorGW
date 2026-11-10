@@ -18,18 +18,38 @@ type cursorStore struct {
 	beforeRename func() error
 }
 
-func openCursorStore(path string) (*cursorStore, error) {
+func checkCursorPath(path string) error {
+	return validateCursorPath(path, true)
+}
+
+func validateCursorPath(path string, allowMissingParent bool) error {
 	dirPath := filepath.Dir(path)
-	if err := os.MkdirAll(dirPath, 0o700); err != nil {
-		return nil, err
-	}
 	info, err := os.Lstat(dirPath)
+	if allowMissingParent && os.IsNotExist(err) {
+		return nil
+	}
 	if err != nil {
-		return nil, err
+		return err
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 || !ok || stat.Uid != uint32(os.Geteuid()) {
-		return nil, fmt.Errorf("unsafe state parent")
+		return fmt.Errorf("unsafe state parent")
+	}
+	if target, err := os.Lstat(path); err == nil {
+		targetStat, statOK := target.Sys().(*syscall.Stat_t)
+		if !target.Mode().IsRegular() || target.Mode().Perm()&0o077 != 0 || !statOK || targetStat.Nlink != 1 || targetStat.Uid != uint32(os.Geteuid()) {
+			return fmt.Errorf("unsafe cursor target")
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func openCursorStore(path string) (*cursorStore, error) {
+	dirPath := filepath.Dir(path)
+	if err := validateCursorPath(path, false); err != nil {
+		return nil, err
 	}
 	dir, err := os.Open(dirPath)
 	if err != nil {

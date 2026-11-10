@@ -1,95 +1,88 @@
-# Migrate Zabbix from HTTP dependent items to the delta bridge
+# Migrate Zabbix from HTTP dependent items to built-in delta forwarding
 
-This operator-controlled procedure replaces the legacy Zabbix HTTP master/dependent-item data path with the packaged delta bridge and trapper template. It does not change gateway device polling. The package does not enable or start the service, create credentials, or import a template.
+This operator-controlled procedure enables the optional Zabbix worker inside the standard `automation-gateway` process. It replaces the legacy Zabbix HTTP master/dependent-item data path with `history.push` trapper items without changing device polling. There is no second application, package, account, configuration tree, or systemd unit.
 
 ## Prerequisites and backup
 
-- A gateway version exposing `/api/v1/metrics/all` and `/api/v1/metrics/delta`, with replay retention long enough for expected outages.
-- HTTPS trust paths from the bridge host to the gateway and Zabbix frontend/API.
-- Zabbix 7.4 with `history.push` available.
-- A dedicated gateway bearer token and a dedicated Zabbix API token.
-- A maintenance window in which the old and new item sets can run in parallel.
+- `automation-gateway` with `/api/v1/metrics/all` and `/api/v1/metrics/delta` available.
+- Zabbix 7.4+ with `history.push`.
+- HTTPS trust from the gateway host to the Zabbix frontend/API.
+- A dedicated Zabbix API token and a pre-created target host.
 
-Before changing Zabbix, export the linked host, the existing `HomeAuthMonitorGW` template, dashboards, value maps, and any local overrides. Back up `/etc/automation-gateway`, the current Zabbix database by the site's normal procedure, and any existing bridge configuration. Record current latest-data timestamps, unsupported items, trigger state, and the active template linkage for rollback comparison.
+Export the linked host, current template, dashboards, value maps, and local overrides. Back up `/etc/automation-gateway` and the Zabbix database by the site's normal procedure. Record latest-data timestamps, unsupported items, triggers, and active template linkage.
 
-## Install and protect files
+## Configure the standard gateway
 
-```bash
-sudo apt install automation-gateway-zabbix
-sudoedit /etc/automation-gateway-zabbix/config.yaml
-```
-
-The package creates `automation-gateway-zabbix`, installs an example configuration, unit, template copy, notices, and binary, and runs `systemctl daemon-reload`. It deliberately does not enable or start the unit.
-
-Use these ownership and mode contracts:
-
-- `/etc/automation-gateway-zabbix`: `root:automation-gateway-zabbix` `0750`;
-- `config.yaml`, gateway token, Zabbix token, and private CA files: regular, singly linked files, normally `root:automation-gateway-zabbix` `0640`; service-owned `0600` credentials are also accepted;
-- `/var/lib/automation-gateway-zabbix`: systemd-managed `StateDirectory`, service-owned `0700`; do not place credentials there.
-
-The YAML must contain paths only, never token values. Keep the example `.invalid` endpoints and placeholder host out of production configuration.
-
-## Zabbix identity and network permissions
-
-Create a dedicated Zabbix service user and API token. Assign the narrowest API role that permits `history.push`, plus write permission to the single target host used by `zabbix_host`. Do not reuse an administrator token. Confirm that trapper items on that host accept the exact generic keys from the supplied template.
-
-`history.push` is submitted to the Zabbix frontend API. For every affected trapper item, **Allowed hosts must include the actual Zabbix frontend IP address**, because the history submission originates there—not the bridge host and not the gateway. In an HA or load-balanced frontend deployment, allow every possible frontend source IP narrowly.
-
-Allow the bridge host outbound HTTPS only to the configured gateway and Zabbix API endpoints, plus required DNS/NTP. The bridge requires no serial, USB, GPIO, raw-socket, or Linux capability access.
-
-## Import and stage the trapper template
-
-The package installs a review copy at:
-
-```text
-/usr/share/automation-gateway-zabbix/template_homeauthmonitorgw.yaml
-```
-
-Template import remains an operator action. Review/export first, then import through the Zabbix UI and link it initially to a staging host or to the production host with duplicate triggers/actions disabled. Do not delete the old HTTP master item until comparison is complete.
-
-The new discovery path is snapshot-only and normally refreshes every 15 minutes. Metric deltas are checked every 5 seconds, while unchanged metrics are repeated by the gateway heartbeat every 5 minutes by default. The old timestamp item prototypes are deprecated: retain them only during comparison, then remove or disable them after all dependent dashboards, triggers, and exports have migrated.
-
-## Check, start, and verify
-
-Validate with the installed service identity. This checks strict YAML, endpoint syntax, and credential file type/ownership/mode without entering the poll loop or creating the systemd-owned state directory. The first service start additionally loads configured CA files and opens the cursor state:
+Install or update only the normal package:
 
 ```bash
-sudo -u automation-gateway-zabbix \
-  /usr/sbin/automation-gateway-zabbix \
-  -config /etc/automation-gateway-zabbix/config.yaml \
-  -check
+sudo apt install automation-gateway
+sudoedit /etc/automation-gateway/config.yaml
 ```
 
-Only after that succeeds:
+Add the optional section shown in `configs/config.example.yaml`:
+
+```yaml
+zabbix:
+  enabled: true
+  api_url: "https://zabbix.example.invalid/api_jsonrpc.php"
+  token_file: "/etc/automation-gateway/tokens/zabbix-api"
+  host: "automation-gateway"
+```
+
+The token must be a protected regular, singly linked file owned by root or `automation-gateway`, mode `0640` or stricter. Keep token values out of YAML. The default cursor path is `/var/lib/automation-gateway/zabbix-cursor`; the standard unit creates `/var/lib/automation-gateway` with mode `0700`.
+
+When `enabled: false`, no Zabbix token, network connection, cursor state, or worker is opened.
+
+## Zabbix identity and permissions
+
+Create a dedicated Zabbix service user/API token. Grant only the API role and target-host write permissions required by `history.push`; do not reuse an administrator token. Confirm the supplied template's trapper items accept the generic keys.
+
+`history.push` is submitted to the Zabbix frontend API. Each affected trapper item's **Allowed hosts** must include the actual frontend source IP. In HA or load-balanced deployments, allow every possible frontend source IP narrowly.
+
+Allow the gateway host outbound HTTPS only to the configured Zabbix API endpoint plus required DNS/NTP. Built-in forwarding does not add device operations; collectors remain read-only.
+
+## Import and stage the template
+
+Review and manually import `zabbix/template_homeauthmonitorgw.yaml` (the package copy is `/usr/share/automation-gateway/template_homeauthmonitorgw.yaml`). Package installation never imports it or changes Zabbix.
+
+Link it first to a staging host, or disable duplicate actions while comparing on production. Snapshot-backed discovery defaults to a 15-minute refresh. Metric deltas default to a 5-second poll; unchanged metrics follow the gateway heartbeat, normally 5 minutes.
+
+## Validate, reload, and verify
 
 ```bash
-sudo systemctl enable --now automation-gateway-zabbix.service
-sudo systemctl --no-pager --full status automation-gateway-zabbix.service
-sudo journalctl -u automation-gateway-zabbix.service -n 100 --no-pager
+sudo -u automation-gateway /usr/sbin/automation-gateway \
+  --config /etc/automation-gateway/config.yaml --check
+sudo systemctl reload automation-gateway.service
+sudo systemctl --no-pager --full status automation-gateway.service
+sudo journalctl -u automation-gateway.service -n 100 --no-pager
 ```
 
-Verify all of the following before cutover:
+Validation loads the protected token, validates the HTTPS endpoint/CA and secure cursor path, and completes before the active generation is stopped. Reload cancels and waits for the old collectors and worker, publishes a new cache generation, and bootstraps forwarding from that generation. Use restart instead when listener or HTTP server settings changed.
 
-1. the startup journal identifies the configured gateway URL, Zabbix API URL, and host but contains no tokens;
-2. a cursor appears below `/var/lib/automation-gateway-zabbix` and advances after successful pushes;
-3. trapper items receive current values with source timestamps;
-4. snapshot-backed discovery appears after the initial push and remains stable across a 15-minute refresh;
-5. intentionally constant values reappear near the 5-minute heartbeat, while changing values follow collector transactions;
-6. source health, triggers, dashboards, and history match the old path through an agreed comparison period;
-7. failure and recovery are visible in the bridge journal without a success line every 5 seconds.
+Verify:
 
-CPU, database writes, and frontend/server load must be measured during the staged comparison. Do not infer a proportional Zabbix CPU reduction from reduced full-snapshot payloads.
+1. logs name the configured Zabbix endpoint and host but contain no token;
+2. `/var/lib/automation-gateway/zabbix-cursor` advances only after confirmed pushes;
+3. trapper values retain source timestamps;
+4. snapshot discovery appears and remains stable across refresh;
+5. constant and changing values follow expected heartbeat/delta cadence;
+6. source health, triggers, dashboards, and history match the old path;
+7. failures and one recovery event are visible without five-second success spam;
+8. the HTTPS API, including `/api/v1/metrics/all` and `/api/v1/metrics/delta?since=<cursor>`, remains independently available.
 
-## Cut over and rollback
+Measure CPU, database writes, and frontend/server load during comparison; reduced repeated snapshots do not imply proportional CPU savings.
 
-After acceptance, disable the old HTTP master item and its dependent triggers/actions before unlinking or deleting anything. Observe at least one inventory refresh and one metric heartbeat. Keep the exported old template and recorded host state until the rollback window closes.
+## Cutover and rollback
 
-Rollback is staged and operator-controlled:
+After acceptance, disable old HTTP items and duplicate actions before unlinking anything. Observe at least one inventory refresh and metric heartbeat.
 
-1. re-enable the old HTTP master/dependent path while leaving its prior configuration unchanged;
-2. disable actions from the new trapper items, then stop and disable `automation-gateway-zabbix.service`;
-3. relink or restore the exported old template only if ordinary re-enable is insufficient;
-4. verify old latest-data timestamps and triggers before removing the new template linkage;
-5. preserve the bridge cursor and configuration until the incident is understood; uninstall only after evidence is collected.
+Rollback is configuration-only:
 
-Do not run both paths with duplicate notification actions enabled. Removing the package stops the bridge through `prerm`; upgrades do not stop, start, enable, or restart it. No production, device, Zabbix, or network commands were executed while preparing this guide.
+1. re-enable the old HTTP path and its prior template linkage;
+2. set `zabbix.enabled: false` in `/etc/automation-gateway/config.yaml`;
+3. validate and reload `automation-gateway.service`;
+4. verify old latest-data timestamps and triggers;
+5. preserve cursor state and logs until the incident is understood.
+
+Do not run duplicate notification actions on both paths. Package updates do not create tokens, import templates, or start/restart services.

@@ -1,285 +1,90 @@
 # HomeAutomationMonitorGW
 
-HomeAutomationMonitorGW is a read-only Linux monitoring gateway. It polls configured NUT, SNMPv3, and generic Modbus RTU sources, caches the latest values, and exposes them through an authenticated HTTPS/JSON API for systems such as Zabbix.
-
-[![Existing architecture view of the SNMPv3 and NUT paths; generic Modbus RTU is documented below](docs/assets/homeautomationmonitorgw-architecture.png)](docs/assets/homeautomationmonitorgw-architecture.svg)
-
-- HTTP requests never trigger device access.
-- SNMP uses GET/BulkWalk only; Modbus supports read-only FC01 through FC04.
-- Poll failures retain the last-known-good sample and expose its stale state.
-- Configuration is strict YAML; protected inputs and permissions are validated.
-- The service runs unprivileged and stores no telemetry database.
-
-## Contents
-
-- [Requirements](#requirements)
-- [Install and update with APT](#install-and-update-with-apt)
-  - [Add the repository](#add-the-repository)
-  - [Install the gateway](#install-the-gateway)
-  - [Install the optional LED client](#install-the-optional-led-client)
-  - [Install the optional Zabbix delta bridge](#install-the-optional-zabbix-delta-bridge)
-  - [Update](#update)
-  - [Migrate an older archive installation](#migrate-an-older-archive-installation)
-- [Configuration](#configuration)
-  - [Server and authentication](#server-and-authentication)
-  - [Polling](#polling)
-  - [NUT](#nut)
-  - [SNMPv3](#snmpv3)
-  - [Generic Modbus RTU](#generic-modbus-rtu)
-- [Operation](#operation)
-  - [Local authenticated curl check](#local-authenticated-curl-check)
-- [API and Zabbix](#api-and-zabbix)
-- [Optional RevPi LED client](#optional-revpi-led-client)
-- [Alternative archive installation](#alternative-archive-installation)
-- [Security](#security)
-- [Detailed documentation](#detailed-documentation)
+HomeAutomationMonitorGW is a read-only Linux monitoring gateway. The single `automation-gateway` process polls configured NUT, SNMPv3, and Modbus RTU sources, retains the latest values in memory, and serves an authenticated HTTPS API. It can optionally forward cache deltas to Zabbix with `history.push`; this is built into the standard process and package, not a second application or service.
 
 ## Requirements
 
-- Linux on `amd64`, `arm64`, `armv7`/Debian `armhf`, or `386`/Debian `i386`.
-- A dedicated unprivileged `automation-gateway` account.
-- Read access to configured NUT, SNMPv3, and serial endpoints.
-- Membership in `dialout` when Modbus RTU requires access to a serial device.
-- Existing TLS certificate, private key, and bearer-token files.
+- Linux with systemd for packaged service operation.
+- Go from `go.mod` only when building from source; prebuilt packages need no Go toolchain.
+- Site-owned TLS certificate/key and bearer-token files.
+- Access to the configured read-only NUT, SNMPv3, or Modbus RTU sources.
+- Optional Zabbix 7.4+ API access when built-in delta forwarding is enabled.
 
-The optional LED client requires a supported Revolution Pi, an `automation-gateway-led` account, and normally membership in `picontrol`.
+## Install
 
-## Install and update with APT
-
-The signed repository provides independently installable gateway, LED-client, and Zabbix delta-bridge packages. Packages preserve existing configuration and credentials and intentionally do not start or restart services.
-
-### Add the repository
-
-```bash
-sudo apt update
-sudo apt install --yes ca-certificates curl gnupg
-sudo install -d -m 0755 /etc/apt/keyrings
-
-curl --fail --silent --show-error --location \
-  https://tseiman.github.io/HomeAutomationMonitorGW/apt/repository-key.asc \
-  --output /tmp/homeautomationmonitorgw-archive-key.asc
-
-gpg --batch --show-keys --fingerprint \
-  /tmp/homeautomationmonitorgw-archive-key.asc
-```
-
-Expected fingerprint:
-
-```text
-FBB4 E68D ABB4 A25F 6E73  C81D D4EA 266E 8BC8 043F
-```
-
-Continue only when the complete fingerprint matches:
-
-```bash
-gpg --batch --dearmor \
-  < /tmp/homeautomationmonitorgw-archive-key.asc \
-  | sudo tee /etc/apt/keyrings/homeautomationmonitorgw.gpg >/dev/null
-sudo chmod 0644 /etc/apt/keyrings/homeautomationmonitorgw.gpg
-rm -f /tmp/homeautomationmonitorgw-archive-key.asc
-
-ARCH="$(dpkg --print-architecture)"
-case "$ARCH" in
-  amd64|arm64|armhf|i386) ;;
-  *) echo "unsupported architecture: $ARCH" >&2; exit 1 ;;
-esac
-
-printf '%s\n' \
-  "deb [arch=$ARCH signed-by=/etc/apt/keyrings/homeautomationmonitorgw.gpg] https://tseiman.github.io/HomeAutomationMonitorGW/apt stable main" \
-  | sudo tee /etc/apt/sources.list.d/homeautomationmonitorgw.list >/dev/null
-
-sudo apt update
-```
-
-Do not use `trusted=yes`, global `apt-key`, or `--allow-unauthenticated`.
-
-### Install the gateway
+The signed APT repository provides `automation-gateway` and the optional, independently installed `automation-gateway-led` client. Installing or upgrading a package preserves site configuration and does not enable or start a service.
 
 ```bash
 sudo apt install automation-gateway
 sudoedit /etc/automation-gateway/config.yaml
 sudo -u automation-gateway /usr/sbin/automation-gateway \
-  --config=/etc/automation-gateway/config.yaml \
-  --check
+  --config /etc/automation-gateway/config.yaml --check
 sudo systemctl enable --now automation-gateway.service
 ```
 
-If Modbus RTU uses a device owned by `dialout`:
+For a release archive, verify its adjacent checksum before extraction, then run `sudo ./scripts/install.sh`.
 
-```bash
-sudo usermod -aG dialout automation-gateway
-sudo systemctl restart automation-gateway.service
+Provision TLS keys, collector secrets, bearer tokens, and an optional Zabbix API token as protected regular files owned by root or `automation-gateway`, mode `0640` or stricter. Do not put secret values in YAML.
+
+## Configure
+
+Start from [`configs/config.example.yaml`](configs/config.example.yaml). It documents HTTPS, authentication, delta-journal, logging, source, and optional Zabbix settings. Unknown YAML fields are rejected.
+
+The optional built-in Zabbix worker uses the active in-memory store directly. A minimal section is:
+
+```yaml
+zabbix:
+  enabled: true
+  api_url: "https://zabbix.example.invalid/api_jsonrpc.php"
+  token_file: "/etc/automation-gateway/tokens/zabbix-api"
+  host: "automation-gateway"
 ```
 
-### Install the optional LED client
+Defaults are a 5-second delta poll, 15-minute inventory refresh, 10-second request timeout, and cursor state at `/var/lib/automation-gateway/zabbix-cursor`. Optional `ca_file`, `batch_size`, `max_pages`, and `max_response_bytes` settings are shown in the example. When `enabled: false`, the gateway does not read a Zabbix token, open Zabbix network connections, create cursor state, or start the worker.
 
-```bash
-sudo apt install automation-gateway-led
-sudoedit /etc/automation-gateway-led/config.yaml
-sudo -u automation-gateway-led /usr/sbin/automation-gateway-led \
-  --config=/etc/automation-gateway-led/config.yaml \
-  --check
-sudo systemctl enable --now automation-gateway-led.service
-```
+Import [`zabbix/template_homeauthmonitorgw.yaml`](zabbix/template_homeauthmonitorgw.yaml) manually and grant a dedicated Zabbix API token only the permissions required for `history.push` to the configured host. Package installation never creates a token, imports a template, or changes Zabbix.
 
-### Install the optional Zabbix delta bridge
+## Validate and operate
 
-The bridge replays gateway journal deltas into Zabbix trapper items through `history.push`; it needs no device access. Installation does not import the supplied template or enable/start the service.
-
-```bash
-sudo apt install automation-gateway-zabbix
-sudoedit /etc/automation-gateway-zabbix/config.yaml
-sudo -u automation-gateway-zabbix /usr/sbin/automation-gateway-zabbix \
-  -config /etc/automation-gateway-zabbix/config.yaml -check
-sudo systemctl enable --now automation-gateway-zabbix.service
-```
-
-Follow the [operator migration guide](docs/ZABBIX_DELTA_MIGRATION.md) for Zabbix permissions, template import, staged verification, and rollback. See the [delta integration architecture](docs/architecture/zabbix-delta-integration.md) for delivery and load semantics.
-
-### Update
-
-```bash
-sudo apt update
-sudo apt install --only-upgrade automation-gateway automation-gateway-led
-sudo systemctl restart automation-gateway.service automation-gateway-led.service
-```
-
-Add `automation-gateway-zabbix` and restart its service when the bridge is installed; omit optional packages and services that are not installed. Validate configuration before restarting when an update requires configuration changes.
-
-### Migrate an older archive installation
-
-Do not mix archive and package installations. Older archive installations normally use `/usr/local/sbin` and units below `/etc/systemd/system`; packages use `/usr/sbin` and `/lib/systemd/system`.
-
-Before switching, back up `/etc/automation-gateway` and `/etc/automation-gateway-led`, then inspect the active units:
-
-```bash
-sudo systemctl show -p FragmentPath,ExecStart automation-gateway.service
-sudo systemctl cat automation-gateway.service
-sudo systemctl show -p FragmentPath,ExecStart automation-gateway-led.service
-```
-
-Stop both services, install the packages, and validate the existing configurations using the `/usr/sbin` binaries. Remove old full units from `/etc/systemd/system` only after confirming they belong to the previous archive installation. Then run `systemctl daemon-reload`, enable the package units, and verify `FragmentPath`, `ExecStart`, and `/proc/$PID/exe` point to `/lib/systemd/system` and `/usr/sbin`.
-
-## Configuration
-
-Start from [`configs/config.example.yaml`](configs/config.example.yaml). Package examples are installed below `/usr/share/doc/automation-gateway/examples/`.
-
-Important paths:
-
-- `/etc/automation-gateway/config.yaml`
-- `/etc/automation-gateway/tokens/`
-- `/etc/automation-gateway/secrets/`
-- site-selected TLS certificate and private-key paths
-- `/etc/automation-gateway-led/config.yaml`
-
-Keep secrets in separate files, not directly in YAML. Protected directories should normally be `root:automation-gateway` with mode `0750`; protected files should normally be `root:automation-gateway` with mode `0640`.
-
-Validate every configuration change before reload or restart:
+Validate every candidate configuration before restart or reload:
 
 ```bash
 sudo -u automation-gateway /usr/sbin/automation-gateway \
-  --config=/etc/automation-gateway/config.yaml \
-  --check
+  --config /etc/automation-gateway/config.yaml --check
 ```
 
-### Server and authentication
-
-Configure the HTTPS listen address, certificate, private key, bearer-token files, and allowed client addresses. Every API request requires an allowed TCP peer and `Authorization: Bearer <token>`.
-
-### Polling
-
-Global defaults and per-source overrides control poll interval, timeout, retries, retry delay, and stale threshold. Only a complete successful poll replaces the cache; partial results are never published.
-
-### NUT
-
-Configure the upsd endpoint and exact UPS name. The collector authenticates when credentials are configured and reads `LIST VAR`; it never sends NUT control commands.
-
-### SNMPv3
-
-Only SNMPv3 USM is accepted. Configure the authPriv account, protected passphrase files, and fixed numeric OID allowlist. The collector uses read-only GET/BulkWalk operations. A WAGO metadata example is available at [`configs/wago-750-880-metadata.example.json`](configs/wago-750-880-metadata.example.json).
-
-### Generic Modbus RTU
-
-Use [`configs/config.example.yaml`](configs/config.example.yaml) for the generic schema or [`configs/modbus-sirax-bt72xx.example.yaml`](configs/modbus-sirax-bt72xx.example.yaml) for the SIRAX DC example.
-
-Serial parameters, slave ID, register addresses, function code, data type, byte/word order, scale, and offset are configured in YAML. Addresses are zero-based PDU addresses. Values are published as:
-
-```text
-published_value = decoded_raw_value * scale + offset
-```
-
-Prefer `/dev/serial/by-id/...`. The USB/RS485 adapter handles transmitter direction; the gateway does not control RTS or GPIO. Only FC01 through FC04 are available.
-
-## Operation
-
-```bash
-systemctl status automation-gateway.service
-journalctl -u automation-gateway.service -n 100 --no-pager
-/usr/sbin/automation-gateway --version
-```
-
-Reload supported changes with:
+Reload creates a new cache generation, stops and waits for the old collectors and optional Zabbix worker, then starts the validated replacement generation. The worker bootstraps the new generation before continuing delta replay. Listener address and HTTP server timeout changes require a restart.
 
 ```bash
 sudo systemctl reload automation-gateway.service
+# Or, when restart-only settings changed:
+sudo systemctl restart automation-gateway.service
+
+sudo systemctl --no-pager --full status automation-gateway.service
+sudo journalctl -u automation-gateway.service -n 100 --no-pager
 ```
 
-A valid reload atomically replaces configuration and collectors. Listen-address and server-timeout changes require a restart. A failed reload leaves the active runtime unchanged.
+Zabbix push failures are logged and retried without stopping collectors or the HTTPS API. Logs identify only the configured Zabbix endpoint and host; tokens are never logged.
 
-### Local authenticated curl check
+## HTTPS API
 
-Test the running service through loopback without disabling TLS verification. Set `GATEWAY_HOST` to a DNS name covered by the server certificate and `CA_FILE` to the issuing CA certificate:
+All routes use the configured TLS listener, client-address allowlist, and bearer-token authentication. API requests read the cache and never trigger device polling.
 
-```bash
-(
-  GATEWAY_HOST='gateway.example.internal'
-  GATEWAY_PORT='8443'
-  CA_FILE='/path/to/ca.crt'
-  TOKEN_FILE='/etc/automation-gateway/tokens/zabbix'
+- `GET /api/v1/metrics/all` returns one complete cache snapshot and the matching cursor. External consumers use it to bootstrap or resynchronize.
+- `GET /api/v1/metrics/delta?since=<cursor>` returns whole cache transactions after that cursor, including `next_cursor` and `has_more`. Cursor generation changes or retention gaps require another full snapshot; malformed or future cursors fail closed.
+- `GET /api/v1/status` returns gateway and collector status.
+- `GET /api/v1/status/events` streams complete status snapshots with Server-Sent Events.
 
-  TOKEN="$(sudo cat "$TOKEN_FILE")" || exit
-  printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" |
-    curl --config - \
-      --fail --silent --show-error \
-      --cacert "$CA_FILE" \
-      --resolve "${GATEWAY_HOST}:${GATEWAY_PORT}:127.0.0.1" \
-      "https://${GATEWAY_HOST}:${GATEWAY_PORT}/api/v1/status"
-)
-```
+The metrics endpoints remain available to external integrations when the built-in Zabbix worker is enabled.
 
-`--resolve` connects to `127.0.0.1` while retaining the certificate hostname. A successful request prints the JSON status snapshot; TLS, authentication, connection, and HTTP errors return a non-zero exit status. The token exists only inside the subshell and is supplied to curl through standard input rather than its command line.
+## Zabbix details
 
-## API and Zabbix
+- [Delta migration and operator procedure](docs/ZABBIX_DELTA_MIGRATION.md)
+- [Delta integration architecture and delivery semantics](docs/architecture/zabbix-delta-integration.md)
+- [Operator reference](docs/OPERATOR_REFERENCE.md)
 
-The authenticated API exposes cached metrics, discovery data, collector health, runtime status, and status Server-Sent Events. It never polls devices on demand.
+The worker persists a cursor only after a complete confirmed `history.push`, preserves original metric timestamps, refreshes the snapshot used for low-level discovery separately, and provides at-least-once delivery.
 
-Import [`zabbix/template_homeauthmonitorgw.yaml`](zabbix/template_homeauthmonitorgw.yaml), set its URL, secret token, interval, and timeout macros, and keep certificate verification enabled. The Zabbix server or proxy address must be included in `allowed_clients`.
+## Security notes
 
-## Optional RevPi LED client
-
-The separate LED client consumes `/api/v1/status/events` and maps connectivity, health, and poll activity to RevPi LED A1 or A2. It never accesses NUT, SNMP, or Modbus devices. See [`clients/revpi-led/README.md`](clients/revpi-led/README.md).
-
-## Alternative archive installation
-
-APT is recommended. For offline or custom deployment, published release archives include checksums and `INSTALL.txt`. Archive installations use `/usr/local/sbin` and `/etc/systemd/system`; do not layer them over package installations.
-
-A local architecture-specific archive can be created with:
-
-```bash
-./scripts/package_release.sh arm64
-```
-
-## Security
-
-- Keep the gateway on a restricted management network.
-- Permit API access only from intended clients.
-- Restrict outbound traffic to configured monitoring endpoints and required DNS/NTP services.
-- Expose only the required serial device.
-- Keep private keys, tokens, and SNMP secrets out of YAML and version control.
-- Preserve TLS certificate verification.
-- Keep every collector read-only.
-
-## Detailed documentation
-
-- [Operator reference](docs/OPERATOR_REFERENCE.md): source builds, archives, rollback, MIB metadata, API schema, Zabbix widget, and troubleshooting.
-- [Project license](LICENSE) and [third-party notices](THIRD_PARTY_LICENSES.md).
+Collectors remain read-only. Keep certificate keys and tokens outside Git, use narrowly scoped service identities, retain certificate verification, and restrict allowed clients and outbound Zabbix access to required addresses. The systemd unit deliberately keeps serial devices visible for configured Modbus RTU sources; it does not use `PrivateDevices=yes`.

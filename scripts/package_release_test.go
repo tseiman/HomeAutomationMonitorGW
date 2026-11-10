@@ -50,10 +50,8 @@ func TestReleaseWorkflowUploadsTopLevelLicensesExactlyOnce(t *testing.T) {
 	if !strings.Contains(releaseJob, "uses: actions/checkout@v7") || !strings.Contains(releaseJob, "release-assets/* LICENSE THIRD_PARTY_LICENSES.md") {
 		t.Fatalf("release job does not upload checked-out license assets exactly once:\n%s", releaseJob)
 	}
-	for _, asset := range []string{"automation-gateway-zabbix-linux-${{ matrix.arch }}", "automation-gateway-zabbix-linux-${{ matrix.arch }}.sha256", "automation-gateway-zabbix_*.deb", "automation-gateway-zabbix_*.deb.sha256"} {
-		if !strings.Contains(workflow, asset) {
-			t.Fatalf("release workflow does not collect bridge asset %q", asset)
-		}
+	if strings.Contains(workflow, "automation-gateway-zabbix") {
+		t.Fatal("release workflow still publishes a separate Zabbix artifact")
 	}
 }
 
@@ -90,8 +88,6 @@ func TestPackageReleaseBuildsMinimalLinuxBundle(t *testing.T) {
 	ledArchivePath := filepath.Join(output, ledArchiveName)
 	assertSHA256File(t, ledBinaryPath, ledBinaryPath+".sha256")
 	assertSHA256File(t, ledArchivePath, ledArchivePath+".sha256")
-	zabbixBinaryPath := filepath.Join(output, "automation-gateway-zabbix-linux-arm64")
-	assertSHA256File(t, zabbixBinaryPath, zabbixBinaryPath+".sha256")
 
 	versionOutput, err := exec.Command(binaryPath, "--version").CombinedOutput()
 	if err != nil {
@@ -110,8 +106,10 @@ func TestPackageReleaseBuildsMinimalLinuxBundle(t *testing.T) {
 		"automation-gateway/configs/config.example.yaml",
 		"automation-gateway/configs/mib-metadata.example.json",
 		"automation-gateway/configs/modbus-sirax-bt72xx.example.yaml",
+		"automation-gateway/docs/ZABBIX_DELTA_MIGRATION.md",
 		"automation-gateway/scripts/install.sh",
 		"automation-gateway/systemd/automation-gateway.service",
+		"automation-gateway/zabbix/template_homeauthmonitorgw.yaml",
 	}
 	sort.Strings(wantEntries)
 	if strings.Join(gotEntries, "\n") != strings.Join(wantEntries, "\n") {
@@ -168,8 +166,8 @@ func TestPackageReleaseBuildsDebianPackage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(matches) != 3 {
-		t.Fatalf("Debian packages = %v, want gateway, optional LED client, and Zabbix bridge", matches)
+	if len(matches) != 2 {
+		t.Fatalf("Debian packages = %v, want gateway and optional LED client", matches)
 	}
 	packages := make(map[string]string)
 	for _, path := range matches {
@@ -182,11 +180,9 @@ func TestPackageReleaseBuildsDebianPackage(t *testing.T) {
 	}
 	debPath := packages["automation-gateway"]
 	ledDebPath := packages["automation-gateway-led"]
-	zabbixDebPath := packages["automation-gateway-zabbix"]
-	if debPath == "" || ledDebPath == "" || zabbixDebPath == "" {
+	if debPath == "" || ledDebPath == "" || len(packages) != 2 {
 		t.Fatalf("unexpected Debian package set: %v", packages)
 	}
-	assertZabbixDebianPackage(t, zabbixDebPath)
 
 	fields, err := exec.Command("dpkg-deb", "-f", debPath, "Package", "Architecture", "Version").CombinedOutput()
 	if err != nil {
@@ -224,6 +220,8 @@ func TestPackageReleaseBuildsDebianPackage(t *testing.T) {
 		"usr/share/automation-gateway/config.example.yaml",
 		"usr/share/automation-gateway/mib-metadata.example.json",
 		"usr/share/automation-gateway/modbus-sirax-bt72xx.example.yaml",
+		"usr/share/automation-gateway/template_homeauthmonitorgw.yaml",
+		"usr/share/doc/automation-gateway/ZABBIX_DELTA_MIGRATION.md",
 		"usr/share/doc/automation-gateway/THIRD_PARTY_LICENSES.md",
 		"lib/systemd/system/automation-gateway.service",
 	} {
@@ -237,6 +235,8 @@ func TestPackageReleaseBuildsDebianPackage(t *testing.T) {
 		"usr/share/automation-gateway/config.example.yaml",
 		"usr/share/automation-gateway/mib-metadata.example.json",
 		"usr/share/automation-gateway/modbus-sirax-bt72xx.example.yaml",
+		"usr/share/automation-gateway/template_homeauthmonitorgw.yaml",
+		"usr/share/doc/automation-gateway/ZABBIX_DELTA_MIGRATION.md",
 		"usr/share/doc/automation-gateway/THIRD_PARTY_LICENSES.md",
 		"usr/share/doc/automation-gateway/copyright",
 	}
@@ -305,74 +305,6 @@ func TestPackageReleaseBuildsDebianPackage(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func assertZabbixDebianPackage(t *testing.T, debPath string) {
-	t.Helper()
-	fields, err := exec.Command("dpkg-deb", "-f", debPath, "Package", "Architecture", "Depends").CombinedOutput()
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(fields)
-	for _, required := range []string{"Package: automation-gateway-zabbix", "Architecture: arm64", "Depends: adduser, systemd, ca-certificates"} {
-		if !strings.Contains(text, required) {
-			t.Fatalf("bridge package metadata lacks %q:\n%s", required, text)
-		}
-	}
-	extracted := t.TempDir()
-	if output, err := exec.Command("dpkg-deb", "-x", debPath, extracted).CombinedOutput(); err != nil {
-		t.Fatalf("bridge extraction failed: %v\n%s", err, output)
-	}
-	want := []string{
-		"lib/systemd/system/automation-gateway-zabbix.service",
-		"usr/sbin/automation-gateway-zabbix",
-		"usr/share/automation-gateway-zabbix/config.example.yaml",
-		"usr/share/automation-gateway-zabbix/template_homeauthmonitorgw.yaml",
-		"usr/share/doc/automation-gateway-zabbix/THIRD_PARTY_LICENSES.md",
-		"usr/share/doc/automation-gateway-zabbix/copyright",
-	}
-	var got []string
-	if err := filepath.Walk(extracted, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.Mode().IsRegular() {
-			rel, err := filepath.Rel(extracted, path)
-			if err != nil {
-				return err
-			}
-			got = append(got, filepath.ToSlash(rel))
-			if strings.HasSuffix(path, ".go") {
-				t.Fatalf("source leaked into bridge package: %s", path)
-			}
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	sort.Strings(got)
-	sort.Strings(want)
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("bridge payload:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
-	control := t.TempDir()
-	if output, err := exec.Command("dpkg-deb", "-e", debPath, control).CombinedOutput(); err != nil {
-		t.Fatalf("bridge control extraction failed: %v\n%s", err, output)
-	}
-	for _, name := range []string{"postinst", "prerm", "postrm"} {
-		path := filepath.Join(control, name)
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		body := string(data)
-		if strings.Contains(body, " enable ") || strings.Contains(body, "template.import") || strings.Contains(body, "zabbix.token") {
-			t.Fatalf("unsafe %s:\n%s", name, body)
-		}
-		if output, err := exec.Command("sh", "-n", path).CombinedOutput(); err != nil {
-			t.Fatalf("%s syntax: %v\n%s", name, err, output)
-		}
 	}
 }
 
