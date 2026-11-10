@@ -450,6 +450,10 @@ Start with [`configs/config.example.yaml`](../configs/config.example.yaml). Impo
 - `server.certificate`, `server.private_key`: securely stored TLS files; the installer never creates or changes them.
 - `authentication.bearer_token_files`: protected token files containing 16–4096 non-whitespace bytes.
 - `authentication.allowed_clients`: exact client IPs or canonical CIDRs; forwarding headers are ignored.
+- `delta.heartbeat`: repeat unchanged metric records after this interval; default `5m`, range `1s`–`24h`.
+- `delta.retention_age`: maximum replay age; default `30m`, range `1m`–`24h`.
+- `delta.max_events`: maximum retained whole poll transactions; default `10000`, range `1`–`1000000`.
+- `delta.max_bytes`: approximate encoded journal budget; default `67108864` (64 MiB), range 1 KiB–1 GiB. A newest transaction larger than the budget remains replayable rather than being silently lost.
 - `sources[].driver`: `nut`, `snmp`, or `modbus_rtu`.
 - `sources[].poll_interval`, `stale_after`, `timeout`: bounded source timing.
 - `sources[].nut.ups`: exact upsd UPS name.
@@ -648,8 +652,34 @@ Every endpoint requires both an allowed TCP peer and a bearer token:
 - `GET /api/v1/sources/{name}/metrics`
 - `GET /api/v1/sources/{name}/discovery`
 - `GET /api/v1/metrics`
+- `GET /api/v1/metrics/all`
+- `GET /api/v1/metrics/delta?since=<cursor>`
 - `GET /api/v1/status`
 - `GET /api/v1/status/events`
+
+### Generic full snapshot and delta replay
+
+`GET /api/v1/metrics/all` atomically returns the complete current source snapshots and the matching replay cursor. `GET /api/v1/metrics/delta?since=<cursor>` returns whole poll transactions after that cursor. These routes read only the in-memory cache and journal; an HTTP request never starts or accelerates a NUT, SNMP, or Modbus poll.
+
+Cursors have the canonical form `v1.<22-character-base64url-generation>.<decimal-sequence>`. The generation is random for every process start and successful configuration reload. A reader should:
+
+1. fetch `/api/v1/metrics/all` and apply its complete `sources` array;
+2. request `/api/v1/metrics/delta?since=<cursor>`;
+3. apply every returned transaction in order and persist `next_cursor`;
+4. repeat while `has_more` is true, then continue polling from the last `next_cursor`.
+
+Reusing a cursor is safe and returns the same retained transactions. A valid request with no newer transaction returns an empty `transactions` array and preserves the supplied cursor as `next_cursor`. `head_cursor` identifies the journal head at response time.
+
+Each transaction contains a complete `status` for one source and a `metrics` array. Metric records use `operation: "upsert"` with a protocol-stable `identity` and complete metric, or `operation: "remove"` as an explicit tombstone. Unchanged metric timestamps alone do not produce records. Changed values or metadata do, and unchanged metrics are repeated with `heartbeat: true` when `delta.heartbeat` is due. Failed polls publish status-only transactions and retain the last-known-good values.
+
+Cursor failures are explicit:
+
+- malformed or missing `since`: `400 Bad Request`;
+- cursor from another runtime/reload generation: `409 Conflict` with `reset_required: true`;
+- cursor older than retained replay: `410 Gone`;
+- cursor ahead of the current journal: `409 Conflict`.
+
+For a wrong-generation or expired cursor, discard local incremental state and take a new full snapshot. Journal limits prune only whole transactions, so one source poll is never partially replayed. The established `/api/v1/metrics` response is unchanged for existing clients.
 
 ### Live gateway status and SSE
 

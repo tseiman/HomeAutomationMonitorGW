@@ -6,6 +6,9 @@
 package cache
 
 import (
+	"encoding/json"
+	"fmt"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -35,17 +38,30 @@ type entry struct {
 
 // Store provides concurrency-safe registration and snapshot state for collector sources.
 type Store struct {
-	mu  sync.RWMutex
-	now func() time.Time
-	m   map[string]*entry
+	mu          sync.RWMutex
+	now         func() time.Time
+	m           map[string]*entry
+	generation  string
+	head        uint64
+	journal     []Transaction
+	journalSize int64
+	lastEmitted map[string]map[string]time.Time
+	options     Options
 }
 
 // New creates an empty Store using now as its clock, or time.Now when now is nil.
-func New(now func() time.Time) *Store {
+func New(now func() time.Time, configured ...Options) *Store {
 	if now == nil {
 		now = time.Now
 	}
-	return &Store{now: now, m: make(map[string]*entry)}
+	options := defaultOptions()
+	if len(configured) > 0 {
+		options = options.withDefaults(configured[0])
+	}
+	return &Store{
+		now: now, m: make(map[string]*entry), generation: newGeneration(),
+		lastEmitted: make(map[string]map[string]time.Time), options: options,
+	}
 }
 
 // Register replaces name with an initially stale source entry for driver and the supplied staleAfter threshold.
@@ -72,22 +88,36 @@ func (s *Store) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.m = make(map[string]*entry)
+	s.lastEmitted = make(map[string]map[string]time.Time)
+	s.generation = newGeneration()
+	s.head = 0
+	s.journal = nil
+	s.journalSize = 0
 }
 
 // Success records a completed poll for name, copies values into the last-known-good snapshot, and ignores unknown names.
-func (s *Store) Success(name string, values []metrics.Metric, duration time.Duration) {
+func (s *Store) Success(name string, values []metrics.Metric, duration time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, ok := s.m[name]
 	if !ok {
-		return
+		return nil
+	}
+	if _, err := indexMetrics(values); err != nil {
+		return err
+	}
+	if _, err := json.Marshal(values); err != nil {
+		return fmt.Errorf("%w: metric values are not JSON encodable: %v", ErrInvalidMetrics, err)
 	}
 	now := s.now().UTC()
+	previous := cloneMetrics(e.snapshot.Metrics)
 	// A successful poll replaces the last-known-good values and clears stale state.
 	e.snapshot.Available, e.snapshot.Stale, e.snapshot.Error = true, false, ""
 	e.snapshot.UnavailableSince = time.Time{}
 	e.snapshot.LastAttempt, e.snapshot.LastSuccess, e.snapshot.PollDuration = now, now, duration
 	e.snapshot.Metrics = cloneMetrics(values)
+	s.recordSuccessLocked(name, previous, e.snapshot, now)
+	return nil
 }
 
 // Failure marks name unavailable and stale with a sanitized error while retaining prior metrics; duration is recorded and unknown names are ignored.
@@ -105,6 +135,7 @@ func (s *Store) Failure(name string, _ error, duration time.Duration) {
 	}
 	e.snapshot.Available, e.snapshot.Stale, e.snapshot.Error = false, true, "collector unavailable"
 	e.snapshot.LastAttempt, e.snapshot.PollDuration = now, duration
+	s.appendTransactionLocked(newTransaction(name, statusFromSnapshot(e.snapshot), nil, now))
 }
 
 // SetDiscovery deep-copies defs into the discovery cache for name and ignores unknown names.
@@ -112,7 +143,15 @@ func (s *Store) SetDiscovery(name string, defs []metrics.Definition) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if e, ok := s.m[name]; ok {
-		e.snapshot.Discovery = cloneDefinitions(defs)
+		cloned := cloneDefinitions(defs)
+		if reflect.DeepEqual(e.snapshot.Discovery, cloned) {
+			return
+		}
+		e.snapshot.Discovery = cloned
+		transaction := newTransaction(name, statusFromSnapshot(e.snapshot), nil, s.now().UTC())
+		transaction.DiscoveryChanged = true
+		transaction.Discovery = cloneDefinitions(cloned)
+		s.appendTransactionLocked(transaction)
 	}
 }
 
@@ -200,6 +239,7 @@ func cloneDefinitions(in []metrics.Definition) []metrics.Definition {
 func cloneMetrics(in []metrics.Metric) []metrics.Metric {
 	out := append([]metrics.Metric(nil), in...)
 	for i := range out {
+		out[i].Value = cloneValue(in[i].Value)
 		if out[i].Labels != nil {
 			out[i].Labels = make(map[string]string, len(out[i].Labels))
 			for k, v := range in[i].Labels {

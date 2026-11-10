@@ -62,8 +62,12 @@ func RunWithTimeout(ctx context.Context, name string, interval, timeout time.Dur
 			if logger != nil {
 				logger.Error("collector poll failed", "source", name, "duration", duration, "error", err)
 			}
+		} else if err := store.Success(name, values, duration); err != nil {
+			store.Failure(name, err, duration)
+			if logger != nil {
+				logger.Error("collector poll rejected", "source", name, "duration", duration, "error", err)
+			}
 		} else {
-			store.Success(name, values, duration)
 			if logger != nil {
 				logger.Info("collector poll succeeded", "source", name, "metrics", len(values), "duration", duration)
 				logger.Debug("collector poll values", "source", name, "values", values)

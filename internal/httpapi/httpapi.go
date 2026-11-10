@@ -137,6 +137,12 @@ func (a *API) serve(w http.ResponseWriter, r *http.Request) {
 	case "/api/v1/metrics":
 		a.allMetrics(w, view.Store)
 		return
+	case "/api/v1/metrics/all":
+		writeJSON(w, http.StatusOK, view.Store.Full())
+		return
+	case "/api/v1/metrics/delta":
+		a.deltaMetrics(w, r, view.Store)
+		return
 	case "/api/v1/status":
 		a.status(w, view.Status)
 		return
@@ -283,6 +289,36 @@ func (a *API) allMetrics(w http.ResponseWriter, store *cache.Store) {
 		out[snapshot.Name] = snapshot
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// deltaMetrics validates the sole cursor parameter and maps replay failures to explicit recovery statuses.
+func (a *API) deltaMetrics(w http.ResponseWriter, r *http.Request, store *cache.Store) {
+	values, present := r.URL.Query()["since"]
+	if !present || len(values) == 0 || values[0] == "" {
+		writeError(w, http.StatusBadRequest, "since is required")
+		return
+	}
+	if len(values) != 1 {
+		writeError(w, http.StatusBadRequest, "since must appear once")
+		return
+	}
+	response, err := store.Delta(values[0])
+	if err == nil {
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	switch {
+	case errors.Is(err, cache.ErrCursorMalformed):
+		writeError(w, http.StatusBadRequest, "invalid cursor")
+	case errors.Is(err, cache.ErrCursorExpired):
+		writeError(w, http.StatusGone, "cursor expired")
+	case errors.Is(err, cache.ErrCursorGeneration):
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "reset_required", "reset_required": true})
+	case errors.Is(err, cache.ErrCursorFuture):
+		writeError(w, http.StatusConflict, "cursor is in the future")
+	default:
+		writeError(w, http.StatusInternalServerError, "delta unavailable")
+	}
 }
 
 // status writes the current canonical gateway and collector activity snapshot.

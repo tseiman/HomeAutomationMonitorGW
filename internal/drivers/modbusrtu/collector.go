@@ -64,7 +64,12 @@ func (c *Collector) Poll(ctx context.Context) ([]metrics.Metric, error) {
 		if !ok {
 			return nil, fmt.Errorf("metric %q was not decoded", definition.Name)
 		}
-		result = append(result, metrics.Metric{Name: definition.Name, Value: value, ValueType: metricValueType(definition), Unit: definition.Unit, Description: definition.Description, Timestamp: at})
+		width, err := RegisterWidth(definition.Type)
+		if err != nil {
+			return nil, err
+		}
+		identity := fmt.Sprintf("fc:%d/address:%d/width:%d", definition.Function, definition.Address, width)
+		result = append(result, metrics.Metric{Identity: identity, Name: definition.Name, Value: value, ValueType: metricValueType(definition), Unit: definition.Unit, Description: definition.Description, Timestamp: at})
 	}
 	return result, nil
 }

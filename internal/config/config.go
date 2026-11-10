@@ -52,9 +52,42 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 type Config struct {
 	Server         Server         `yaml:"server"`
 	Authentication Authentication `yaml:"authentication"`
+	Delta          Delta          `yaml:"delta"`
 	Sources        []Source       `yaml:"sources"`
 	Logging        Logging        `yaml:"logging"`
 	Secrets        Secrets        `yaml:"-"`
+}
+
+// Delta bounds the in-memory change journal and unchanged-value heartbeats.
+type Delta struct {
+	Heartbeat    Duration `yaml:"heartbeat"`
+	RetentionAge Duration `yaml:"retention_age"`
+	MaxEvents    int      `yaml:"max_events"`
+	MaxBytes     int64    `yaml:"max_bytes"`
+	maxEventsSet bool
+	maxBytesSet  bool
+}
+
+// UnmarshalYAML retains explicit zero limits so they are rejected rather than defaulted.
+func (d *Delta) UnmarshalYAML(node *yaml.Node) error {
+	type plain Delta
+	var decoded plain
+	if err := node.Decode(&decoded); err != nil {
+		return err
+	}
+	*d = Delta(decoded)
+	for index := 0; index+1 < len(node.Content); index += 2 {
+		switch node.Content[index].Value {
+		case "heartbeat", "retention_age":
+		case "max_events":
+			d.maxEventsSet = true
+		case "max_bytes":
+			d.maxBytesSet = true
+		default:
+			return fmt.Errorf("delta: field %q not found", node.Content[index].Value)
+		}
+	}
+	return nil
 }
 
 // Server contains HTTPS listener and lifecycle settings.
@@ -516,6 +549,18 @@ func (c *Config) loadSecrets() error {
 
 // defaults fills omitted optional settings with operational defaults, skipping disabled sources completely.
 func (c *Config) defaults() {
+	if !c.Delta.Heartbeat.set {
+		c.Delta.Heartbeat.Duration = 5 * time.Minute
+	}
+	if !c.Delta.RetentionAge.set {
+		c.Delta.RetentionAge.Duration = 30 * time.Minute
+	}
+	if !c.Delta.maxEventsSet {
+		c.Delta.MaxEvents = 10000
+	}
+	if !c.Delta.maxBytesSet {
+		c.Delta.MaxBytes = 64 << 20
+	}
 	if !c.Server.ReadTimeout.set && c.Server.ReadTimeout.Duration == 0 {
 		c.Server.ReadTimeout.Duration = 10 * time.Second
 	}
@@ -600,6 +645,18 @@ func (c *Config) defaults() {
 
 // Validate checks server, authentication, active-source, timing, address, and protocol constraints.
 func (c Config) Validate() error {
+	if c.Delta.Heartbeat.Duration < 5*time.Second || c.Delta.Heartbeat.Duration > 24*time.Hour {
+		return errors.New("delta.heartbeat must be between 5s and 24h")
+	}
+	if c.Delta.RetentionAge.Duration < time.Minute || c.Delta.RetentionAge.Duration > 24*time.Hour {
+		return errors.New("delta.retention_age must be between 1m and 24h")
+	}
+	if c.Delta.MaxEvents < 1 || c.Delta.MaxEvents > 1000000 {
+		return errors.New("delta.max_events must be between 1 and 1000000")
+	}
+	if c.Delta.MaxBytes < 1024 || c.Delta.MaxBytes > 1<<30 {
+		return errors.New("delta.max_bytes must be between 1024 and 1073741824")
+	}
 	if c.Server.Listen == "" {
 		return errors.New("server.listen is required")
 	}

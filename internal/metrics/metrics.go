@@ -9,6 +9,9 @@ import "time"
 
 // Metric is one timestamped, protocol-independent observed value.
 type Metric struct {
+	// Identity is a protocol-stable comparison key. It is carried separately by
+	// delta records and intentionally omitted from every legacy JSON projection.
+	Identity    string            `json:"-"`
 	Name        string            `json:"name"`
 	Value       any               `json:"value"`
 	ValueType   string            `json:"value_type"`

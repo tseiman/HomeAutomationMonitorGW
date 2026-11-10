@@ -277,11 +277,12 @@ func TestRuntimePublishesModbusDiscoveryBeforeAbsentDevicePollCompletes(t *testi
 }
 
 type lifecycleReader struct {
-	started   chan struct{}
-	exited    chan struct{}
-	onRead    func() error
-	startOnce sync.Once
-	exitOnce  sync.Once
+	started         chan struct{}
+	exited          chan struct{}
+	onRead          func() error
+	successOnCancel []byte
+	startOnce       sync.Once
+	exitOnce        sync.Once
 }
 
 func (r *lifecycleReader) read(ctx context.Context) ([]byte, error) {
@@ -293,6 +294,9 @@ func (r *lifecycleReader) read(ctx context.Context) ([]byte, error) {
 	}
 	<-ctx.Done()
 	r.exitOnce.Do(func() { close(r.exited) })
+	if r.successOnCancel != nil {
+		return append([]byte(nil), r.successOnCancel...), nil
+	}
 	return nil, ctx.Err()
 }
 func (r *lifecycleReader) ReadCoils(ctx context.Context, _ uint8, _, _ uint16) ([]byte, error) {
@@ -389,6 +393,45 @@ func TestReloadWaitsForOldTransactionsAndClosesBusBeforeNewPolling(t *testing.T)
 	case err := <-violation:
 		t.Fatal(err)
 	default:
+	}
+}
+
+func TestReloadCarriesPollThatCompletesDuringCancellationIntoNewSnapshot(t *testing.T) {
+	directory := t.TempDir()
+	certificate, key := pair(t, directory, "reload-final-poll", 12)
+	token := filepath.Join(directory, "token")
+	if err := os.WriteFile(token, []byte("reload-final-poll-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configuration := filepath.Join(directory, "config.yaml")
+	writeModbusConfig(t, configuration, certificate, key, token, "voltage", 72)
+
+	firstReader := &lifecycleReader{started: make(chan struct{}), exited: make(chan struct{}), successOnCancel: []byte{0, 42}}
+	firstBus := &lifecycleBus{reader: firstReader, closed: make(chan struct{})}
+	secondReader := &lifecycleReader{started: make(chan struct{}), exited: make(chan struct{})}
+	secondBus := &lifecycleBus{reader: secondReader, closed: make(chan struct{})}
+	buses := []modbusBus{firstBus, secondBus}
+	runtime, err := newFilesWithDependencies([]string{configuration}, nil, dependencies{newModbusBus: func() modbusBus {
+		bus := buses[0]
+		buses = buses[1:]
+		return bus
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	select {
+	case <-firstReader.started:
+	case <-time.After(time.Second):
+		t.Fatal("old poll did not start")
+	}
+
+	if err := runtime.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok := runtime.View().Store.Snapshot("meter")
+	if !ok || len(snapshot.Metrics) != 1 || snapshot.Metrics[0].Value != float64(42) {
+		t.Fatalf("late successful poll was not carried into new generation: %+v ok=%v", snapshot, ok)
 	}
 }
 

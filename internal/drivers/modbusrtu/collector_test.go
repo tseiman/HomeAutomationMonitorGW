@@ -78,8 +78,9 @@ func TestCollectorExecutesPlannedBlocksDecodesBitsAndAllRegisterValues(t *testin
 	}
 	wantValues := []any{float64(1), float64(0), float64(42), float64(-100), float64(12.5)}
 	wantTypes := []string{"integer", "integer", "integer", "integer", "number"}
+	wantIdentities := []string{"fc:1/address:10/width:1", "fc:1/address:11/width:1", "fc:3/address:20/width:1", "fc:3/address:21/width:1", "fc:3/address:22/width:2"}
 	for i := range got {
-		if got[i].Name != []string{"coil_a", "coil_b", "status", "temperature", "voltage"}[i] || !reflect.DeepEqual(got[i].Value, wantValues[i]) || got[i].ValueType != wantTypes[i] || got[i].Timestamp != at {
+		if got[i].Identity != wantIdentities[i] || got[i].Name != []string{"coil_a", "coil_b", "status", "temperature", "voltage"}[i] || !reflect.DeepEqual(got[i].Value, wantValues[i]) || got[i].ValueType != wantTypes[i] || got[i].Timestamp != at {
 			t.Fatalf("metric[%d]=%+v want value=%#v type=%s", i, got[i], wantValues[i], wantTypes[i])
 		}
 	}

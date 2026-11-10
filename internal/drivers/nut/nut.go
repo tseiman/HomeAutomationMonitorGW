@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -108,7 +109,7 @@ func (c Collector) Poll(ctx context.Context) ([]metrics.Metric, error) {
 	out := make([]metrics.Metric, 0, len(vars))
 	for name, raw := range vars {
 		value, typ := parseValue(raw)
-		out = append(out, metrics.Metric{Name: name, Value: value, ValueType: typ, Timestamp: now})
+		out = append(out, metrics.Metric{Identity: name, Name: name, Value: value, ValueType: typ, Timestamp: now})
 	}
 	sortMetrics(out)
 	return out, nil
@@ -116,7 +117,7 @@ func (c Collector) Poll(ctx context.Context) ([]metrics.Metric, error) {
 
 // parseValue returns raw as a number with type "number" when it parses as float64, otherwise as unchanged text with type "string".
 func parseValue(raw string) (any, string) {
-	if v, err := strconv.ParseFloat(raw, 64); err == nil {
+	if v, err := strconv.ParseFloat(raw, 64); err == nil && !math.IsNaN(v) && !math.IsInf(v, 0) {
 		return v, "number"
 	}
 	return raw, "string"

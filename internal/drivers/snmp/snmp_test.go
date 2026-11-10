@@ -41,7 +41,7 @@ func TestConvertPDUUsesMetadataAndSafeTypes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.Name != "sysUpTime" || m.Value != uint64(123) || m.ValueType != "counter" || m.Unit != "centiseconds" {
+	if m.Identity != "1.3.6.1.2.1.1.3.0" || m.Name != "sysUpTime" || m.Value != uint64(123) || m.ValueType != "counter" || m.Unit != "centiseconds" {
 		t.Fatalf("metric=%+v", m)
 	}
 }

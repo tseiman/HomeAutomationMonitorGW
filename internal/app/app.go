@@ -266,7 +266,10 @@ func sourceIdentity(source config.Source, metadata snmpdriver.Metadata) [sha256.
 
 // buildGeneration pre-registers every source, carries compatible snapshots forward, and hashes all bearer tokens.
 func buildGeneration(cfg config.Config, cert *tls.Certificate, specs []sourceSpec, previous *generation) *generation {
-	store := cache.New(time.Now)
+	store := cache.New(time.Now, cache.Options{
+		Heartbeat: cfg.Delta.Heartbeat.Duration, RetentionAge: cfg.Delta.RetentionAge.Duration,
+		MaxEvents: cfg.Delta.MaxEvents, MaxBytes: cfg.Delta.MaxBytes,
+	})
 	identities := make(map[string][sha256.Size]byte, len(specs))
 	for _, spec := range specs {
 		identities[spec.name] = spec.identity
@@ -311,7 +314,6 @@ func (r *Runtime) Reload() error {
 		_ = cand.close()
 		return errors.New("server listener, timeouts, and header limit require restart")
 	}
-	next := buildGeneration(cand.cfg, cand.cert, cand.specs, old)
 	if r.cancel != nil {
 		r.cancel()
 		r.cancel = nil
@@ -325,6 +327,9 @@ func (r *Runtime) Reload() error {
 		logger.Warn("old generation resource cleanup failed", "error", err)
 	}
 	r.resources = nil
+	// Snapshot carryover happens only after every old poll has stopped, so a poll
+	// completing during cancellation is either fully retained or fully absent.
+	next := buildGeneration(cand.cfg, cand.cert, cand.specs, old)
 	if old != nil && old.status != nil {
 		old.status.Close()
 	}

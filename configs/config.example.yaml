@@ -20,6 +20,14 @@ authentication:
     - "192.168.2.0/24"
     - "2001:db8:1234::/64"
 
+# In-memory delta replay. All limits are strict and reloadable; a successful
+# reload creates a new cursor generation, so readers must take a new full snapshot.
+delta:
+  heartbeat: "5m"          # unchanged metrics are repeated at this interval (1s-24h)
+  retention_age: "30m"     # replay age window (1m-24h)
+  max_events: 10000        # whole poll transactions (1-1000000)
+  max_bytes: 67108864      # approximate encoded journal bytes (1KiB-1GiB)
+
 logging:
   level: "info"
 

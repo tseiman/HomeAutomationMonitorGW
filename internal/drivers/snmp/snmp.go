@@ -163,7 +163,7 @@ func ConvertPDU(p gosnmp.SnmpPDU, metadata Metadata, at time.Time) (metrics.Metr
 	default:
 		return metrics.Metric{}, fmt.Errorf("unsupported SNMP value type %s", p.Type.String())
 	}
-	return metrics.Metric{Name: name, Value: value, ValueType: typ, Unit: d.Unit, Description: d.Description, Timestamp: at, Labels: map[string]string{"oid": oid}}, nil
+	return metrics.Metric{Identity: oid, Name: name, Value: value, ValueType: typ, Unit: d.Unit, Description: d.Description, Timestamp: at, Labels: map[string]string{"oid": oid}}, nil
 }
 
 // normalizeOID trims surrounding whitespace and one leading dot from s, returning the canonical lookup form.

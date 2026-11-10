@@ -60,3 +60,26 @@ func TestClientUsesOnlyListVAR(t *testing.T) {
 		t.Fatalf("unsafe/unexpected command %q", cmd)
 	}
 }
+
+type fixedVariables map[string]string
+
+func (v fixedVariables) ListVariables(context.Context, string) (map[string]string, error) {
+	return v, nil
+}
+
+func TestCollectorUsesNUTVariableNameAsStableIdentity(t *testing.T) {
+	collector := Collector{Client: fixedVariables{"battery.charge": "98"}, UPS: "quint"}
+	got, err := collector.Poll(context.Background())
+	if err != nil || len(got) != 1 || got[0].Identity != "battery.charge" {
+		t.Fatalf("metrics=%+v err=%v", got, err)
+	}
+}
+
+func TestParseValueKeepsNonFiniteNUTValuesAsText(t *testing.T) {
+	for _, raw := range []string{"NaN", "Inf", "+Inf", "-Inf"} {
+		value, valueType := parseValue(raw)
+		if value != raw || valueType != "string" {
+			t.Fatalf("parseValue(%q)=(%v, %q), want unchanged string", raw, value, valueType)
+		}
+	}
+}
