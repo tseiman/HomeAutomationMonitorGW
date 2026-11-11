@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -54,11 +55,71 @@ func (w *blockingResponseWriter) Write(body []byte) (int, error) {
 	<-w.release
 	return len(body), nil
 }
+func (w *blockingResponseWriter) FlushError() error { return nil }
+
+type failingResponseWriter struct {
+	header   http.Header
+	writeErr error
+	flushErr error
+	body     bytes.Buffer
+}
+
+func (w *failingResponseWriter) Header() http.Header { return w.header }
+func (w *failingResponseWriter) WriteHeader(int)     {}
+func (w *failingResponseWriter) Write(body []byte) (int, error) {
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	return w.body.Write(body)
+}
+func (w *failingResponseWriter) FlushError() error { return w.flushErr }
+
+func TestTokenPollFailedInitialResponseDoesNotAdvanceState(t *testing.T) {
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	store := cache.New(func() time.Time { return now })
+	store.Register("source", "test", time.Minute)
+	token := "failed-initial-reader-token"
+	digest := sha256.Sum256([]byte(token))
+	handler := New(func() View {
+		return View{Store: store, TokenDigests: [][sha256.Size]byte{digest}, AllowedClients: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}, PollFullInterval: 10 * time.Minute}
+	}, Options{Now: func() time.Time { return now }})
+
+	failed := &failingResponseWriter{header: make(http.Header), writeErr: errors.New("write failed")}
+	handler.ServeHTTP(failed, request(http.MethodGet, "/api/v1/metrics/poll", "Bearer "+token))
+	got := pollRequest(t, handler, token)
+	if got["mode"] != "full" || got["reason"] != "first_request" {
+		t.Fatalf("retry after failed initial response=%v", got)
+	}
+}
+
+func TestTokenPollFailedSparseFlushReplaysDelta(t *testing.T) {
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	store := cache.New(func() time.Time { return now })
+	store.Register("source", "test", time.Minute)
+	_ = store.Success("source", []metrics.Metric{{Identity: "voltage", Name: "voltage", Value: 1, ValueType: "number", Timestamp: now}}, time.Millisecond)
+	token := "failed-sparse-reader-token"
+	digest := sha256.Sum256([]byte(token))
+	handler := New(func() View {
+		return View{Store: store, TokenDigests: [][sha256.Size]byte{digest}, AllowedClients: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}, PollFullInterval: 10 * time.Minute}
+	}, Options{Now: func() time.Time { return now }})
+	_ = pollRequest(t, handler, token)
+
+	now = now.Add(time.Second)
+	_ = store.Success("source", []metrics.Metric{{Identity: "voltage", Name: "voltage", Value: 2, ValueType: "number", Timestamp: now}}, time.Millisecond)
+	failed := &failingResponseWriter{header: make(http.Header), flushErr: errors.New("flush failed")}
+	handler.ServeHTTP(failed, request(http.MethodGet, "/api/v1/metrics/poll", "Bearer "+token))
+	got := pollRequest(t, handler, token)
+	encoded, _ := json.Marshal(got)
+	if got["mode"] != "sparse" || !bytes.Contains(encoded, []byte(`"value":2`)) {
+		t.Fatalf("retry after failed sparse flush=%s", encoded)
+	}
+}
 
 func TestTokenPollFullSparseLatestCollapseRemovalAndIndependentReaders(t *testing.T) {
 	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
 	store := cache.New(func() time.Time { return now }, cache.Options{Heartbeat: time.Minute, RetentionAge: time.Hour, MaxEvents: 100, MaxBytes: 1 << 20})
 	store.Register("source", "test", time.Minute)
+	_ = store.Success("source", []metrics.Metric{{Identity: "voltage", Name: "voltage", Value: 1, ValueType: "number", Timestamp: now}}, time.Millisecond)
 	tokens := []string{"poll-reader-token-one", "poll-reader-token-two"}
 	digests := [][sha256.Size]byte{sha256.Sum256([]byte(tokens[0])), sha256.Sum256([]byte(tokens[1]))}
 	api := New(func() View {
@@ -145,6 +206,82 @@ func TestTokenPollSparseCarriesOnlyChangedMetrics(t *testing.T) {
 	}
 	if empty.Body.Len() >= 512 {
 		t.Fatalf("empty sparse payload is %d bytes for 500 cached metrics", empty.Body.Len())
+	}
+}
+
+func TestTokenPollNewMetricForcesImmediateFull(t *testing.T) {
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	store := cache.New(func() time.Time { return now }, cache.Options{Heartbeat: time.Hour, RetentionAge: time.Hour, MaxEvents: 100, MaxBytes: 1 << 20})
+	store.Register("source", "test", time.Minute)
+	_ = store.Success("source", []metrics.Metric{{Identity: "existing", Name: "existing", Value: 1, ValueType: "number", Timestamp: now}}, time.Millisecond)
+	token := "new-metric-reader-token"
+	digest := sha256.Sum256([]byte(token))
+	handler := New(func() View {
+		return View{Store: store, TokenDigests: [][sha256.Size]byte{digest}, AllowedClients: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}, PollFullInterval: 10 * time.Minute}
+	}, Options{Now: func() time.Time { return now }})
+	_ = pollRequest(t, handler, token)
+
+	now = now.Add(time.Second)
+	_ = store.Success("source", []metrics.Metric{
+		{Identity: "existing", Name: "existing", Value: 1, ValueType: "number", Timestamp: now},
+		{Identity: "new", Name: "new", Value: 2, ValueType: "number", Timestamp: now},
+	}, time.Millisecond)
+	got := pollRequest(t, handler, token)
+	if got["mode"] != "full" || got["reason"] != "metric_added" {
+		t.Fatalf("new metric response=%v", got)
+	}
+}
+
+func TestTokenPollFailedMetricAddedFullDoesNotUpdateBaseline(t *testing.T) {
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	store := cache.New(func() time.Time { return now })
+	store.Register("source", "test", time.Minute)
+	_ = store.Success("source", []metrics.Metric{{Identity: "existing", Name: "existing", Value: 1, ValueType: "number", Timestamp: now}}, time.Millisecond)
+	token := "failed-new-metric-reader-token"
+	digest := sha256.Sum256([]byte(token))
+	handler := New(func() View {
+		return View{Store: store, TokenDigests: [][sha256.Size]byte{digest}, AllowedClients: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}, PollFullInterval: 10 * time.Minute}
+	}, Options{Now: func() time.Time { return now }})
+	_ = pollRequest(t, handler, token)
+
+	now = now.Add(time.Second)
+	_ = store.Success("source", []metrics.Metric{
+		{Identity: "existing", Name: "existing", Value: 1, ValueType: "number", Timestamp: now},
+		{Identity: "new", Name: "new", Value: 2, ValueType: "number", Timestamp: now},
+	}, time.Millisecond)
+	failed := &failingResponseWriter{header: make(http.Header), writeErr: errors.New("write failed")}
+	handler.ServeHTTP(failed, request(http.MethodGet, "/api/v1/metrics/poll", "Bearer "+token))
+	got := pollRequest(t, handler, token)
+	if got["mode"] != "full" || got["reason"] != "metric_added" {
+		t.Fatalf("retry after failed metric-added full=%v", got)
+	}
+}
+
+func TestTokenPollMetricBaselineIsIsolatedPerToken(t *testing.T) {
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	store := cache.New(func() time.Time { return now })
+	store.Register("source", "test", time.Minute)
+	_ = store.Success("source", []metrics.Metric{{Identity: "existing", Name: "existing", Value: 1, ValueType: "number", Timestamp: now}}, time.Millisecond)
+	tokens := []string{"baseline-token-a", "baseline-token-b"}
+	digests := [][sha256.Size]byte{sha256.Sum256([]byte(tokens[0])), sha256.Sum256([]byte(tokens[1]))}
+	handler := New(func() View {
+		return View{Store: store, TokenDigests: digests, AllowedClients: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}, PollFullInterval: 10 * time.Minute}
+	}, Options{Now: func() time.Time { return now }})
+	_ = pollRequest(t, handler, tokens[0])
+	_ = pollRequest(t, handler, tokens[1])
+
+	now = now.Add(time.Second)
+	_ = store.Success("source", []metrics.Metric{
+		{Identity: "existing", Name: "existing", Value: 1, ValueType: "number", Timestamp: now},
+		{Identity: "new", Name: "new", Value: 2, ValueType: "number", Timestamp: now},
+	}, time.Millisecond)
+	failed := &failingResponseWriter{header: make(http.Header), writeErr: errors.New("write failed")}
+	handler.ServeHTTP(failed, request(http.MethodGet, "/api/v1/metrics/poll", "Bearer "+tokens[0]))
+	if got := pollRequest(t, handler, tokens[1]); got["mode"] != "full" || got["reason"] != "metric_added" {
+		t.Fatalf("token B metric-added full=%v", got)
+	}
+	if got := pollRequest(t, handler, tokens[0]); got["mode"] != "full" || got["reason"] != "metric_added" {
+		t.Fatalf("token A retry after token B commit=%v", got)
 	}
 }
 
@@ -270,10 +407,57 @@ func TestTokenPollSlowWriterDoesNotBlockAnotherToken(t *testing.T) {
 	<-slowDone
 }
 
+func TestTokenPollSlowWriterDoesNotBlockSameTokenOrSkipDelta(t *testing.T) {
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	store := cache.New(func() time.Time { return now })
+	store.Register("source", "test", time.Minute)
+	_ = store.Success("source", []metrics.Metric{{Identity: "x", Name: "x", Value: 1, ValueType: "number", Timestamp: now}}, time.Millisecond)
+	token := "same-token-concurrent-reader"
+	digest := sha256.Sum256([]byte(token))
+	handler := New(func() View {
+		return View{Store: store, TokenDigests: [][sha256.Size]byte{digest}, AllowedClients: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}, PollFullInterval: 10 * time.Minute}
+	}, Options{Now: func() time.Time { return now }})
+	_ = pollRequest(t, handler, token)
+	now = now.Add(time.Second)
+	_ = store.Success("source", []metrics.Metric{{Identity: "x", Name: "x", Value: 2, ValueType: "number", Timestamp: now}}, time.Millisecond)
+
+	writer := &blockingResponseWriter{header: make(http.Header), entered: make(chan struct{}, 1), release: make(chan struct{})}
+	slowDone := make(chan struct{})
+	go func() {
+		defer close(slowDone)
+		handler.ServeHTTP(writer, request(http.MethodGet, "/api/v1/metrics/poll", "Bearer "+token))
+	}()
+	select {
+	case <-writer.entered:
+	case <-time.After(time.Second):
+		t.Fatal("slow same-token request did not reach response write")
+	}
+
+	duplicateDone := make(chan map[string]any, 1)
+	go func() { duplicateDone <- pollRequest(t, handler, token) }()
+	select {
+	case duplicate := <-duplicateDone:
+		encoded, _ := json.Marshal(duplicate)
+		if duplicate["mode"] != "sparse" || !bytes.Contains(encoded, []byte(`"value":2`)) {
+			t.Fatalf("concurrent duplicate=%s", encoded)
+		}
+	case <-time.After(500 * time.Millisecond):
+		close(writer.release)
+		<-slowDone
+		t.Fatal("slow response write blocked the same token")
+	}
+	close(writer.release)
+	<-slowDone
+	if got := pollRequest(t, handler, token); got["mode"] != "sparse" || len(got["sources"].([]any)) != 0 {
+		t.Fatalf("concurrent commit skipped or replayed progress=%v", got)
+	}
+}
+
 func TestTokenPollFollowsAllDeltaPagesAndKeepsLatestValue(t *testing.T) {
 	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
 	store := cache.New(func() time.Time { return now }, cache.Options{Heartbeat: time.Hour, RetentionAge: time.Hour, MaxEvents: 2000, MaxBytes: 16 << 20})
 	store.Register("source", "test", time.Minute)
+	_ = store.Success("source", []metrics.Metric{{Identity: "x", Name: "x", Value: 0, ValueType: "number", Timestamp: now}}, time.Millisecond)
 	token := "paginated-reader-token"
 	digest := sha256.Sum256([]byte(token))
 	handler := New(func() View {

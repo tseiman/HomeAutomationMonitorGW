@@ -18,9 +18,12 @@ Import `zabbix/template_homeauthmonitorgw.yaml` with update semantics. The templ
 
 - `{$AUTOMATION_GATEWAY_URL}`: the gateway HTTPS origin;
 - `{$AUTOMATION_GATEWAY_TOKEN}`: a Zabbix `SECRET_TEXT` macro used only in the `Authorization` header;
-- `{$AUTOMATION_GATEWAY_INTERVAL}` and `{$AUTOMATION_GATEWAY_TIMEOUT}`.
+- `{$AUTOMATION_GATEWAY_INTERVAL}`: the `/metrics/poll` cadence, default `5s`;
+- `{$AUTOMATION_GATEWAY_TIMEOUT}`: the HTTPS request timeout.
 
-The HTTP-agent master fetches `GET /api/v1/metrics/poll` with peer and host verification enabled. The default interval is `5s`; the gateway's generic `delta.poll_full_interval` defaults to `10m`. Sparse envelopes contain only changed source status and metric upserts, never a full-state copy. Preprocessing discards empty sparse responses and missing sparse paths; composite/full-state-derived items and discovery run only on full responses. A metric removal forces a full response with reason `metric_removed` so discovery can reconcile inventory. Existing item keys, UUIDs, units, scaling, history, triggers, and dashboard references remain stable. Per-metric timestamp prototypes remain not discovered and disabled.
+Exactly one HTTP-agent item, new raw master `automation.gateway.poll.raw`, fetches `GET /api/v1/metrics/poll` with peer and host verification enabled at the default `5s` interval. Raw history and trends are disabled, so its changing payload is never written to history. Lightweight dependent item `automation.gateway.reachable` unconditionally converts every accepted raw value to numeric `1`, without parsing the body, and uses a one-minute discard-unchanged heartbeat with 7-day history and 30-day trends. The existing reachability trigger UUID monitors `nodata(.../automation.gateway.reachable,5m)`. A malformed HTTP 200 therefore proves reachability without storing its body or making a second request.
+
+The existing stable `automation.gateway.snapshot` item keeps its UUID, key, one-day history, and downstream identity, but is now dependent on the raw master. Its JavaScript validates and projects the envelope, and its one-minute discard-unchanged heartbeat refreshes a valid stable value. A valid empty sparse envelope becomes `{"__poll_mode":"empty"}`; malformed envelopes are discarded. The new snapshot `nodata(...,5m)` trigger therefore reports absence of valid poll data independently from HTTP reachability. Every existing metric, source, and discovery dependent remains mastered by the snapshot and discards the empty sentinel. Composite/full-state-derived items and discovery run only on full responses. Metric removal and a newly observed source-plus-stable-metric identity force full responses with reasons `metric_removed` and `metric_added`, respectively, so discovery reconciles immediately. No additional network request is made. Existing deployed item keys, UUIDs, units, scaling, history, other triggers, and dashboard references remain stable; the raw and reachability items plus the data-validity trigger implement the split. Per-metric timestamp prototypes remain not discovered and disabled.
 
 ## Validate
 
@@ -31,13 +34,13 @@ sudo -u automation-gateway /usr/sbin/automation-gateway \
 
 Then verify from Zabbix that:
 
-1. the master item is supported and receives HTTP 200;
+1. the raw poll master is supported and receives HTTP 200, while the dependent snapshot accepts valid envelopes;
 2. source discovery and dependent items update;
 3. dashboards and triggers retain their existing item keys;
 4. the gateway allowlist contains only intended client addresses;
 5. TLS peer and hostname verification remain enabled;
-6. an unchanged sparse poll writes no master value, and changing one metric updates that metric without rewriting unrelated ordinary metric prototypes;
-7. discovery remains present through sparse polls and refreshes on the next forced full response.
+6. quiet valid polling refreshes the stable empty sentinel on its one-minute heartbeat without satisfying the valid-data no-data trigger;
+7. changing one existing metric updates only that metric, while adding a new metric produces an immediate `metric_added` full response and refreshed discovery.
 
 Package installation never imports the template or changes Zabbix.
 
@@ -45,4 +48,4 @@ Package installation never imports the template or changes Zabbix.
 
 The generic delta API is for clients that can retain their own opaque cursor. Such a client bootstraps with `/api/v1/metrics/all`, applies deltas from `/api/v1/metrics/delta?since=<cursor>`, retries failures with the same cursor, follows `has_more` with `next_cursor`, and resynchronizes from a full snapshot after an expired or wrong-generation cursor.
 
-Native `/metrics/poll` advances its in-memory token cursor when producing a response because Zabbix supplies no acknowledgement. It intentionally collapses intermediate records to the latest metric state. A lost or ambiguous HTTP response is therefore not replayed losslessly; the periodic full response restores current state. Do not describe this path as lossless history or as preserving every original history timestamp.
+Native `/metrics/poll` computes progress without committing it, releases the token lock, encodes/writes/locally flushes the response, and then commits with a per-token version check. Encoding, write, or flush failure leaves cursor, full timer, and known-metric baseline unchanged; concurrent same-token requests may safely duplicate a response but cannot skip progress. This is only a local delivery boundary. Zabbix supplies no end-to-end acknowledgement, so a failure after successful local flush remains ambiguous. The adapter intentionally collapses intermediate records to latest metric state, and the periodic full response restores current state. Do not describe this path as lossless history or as preserving every original history timestamp.

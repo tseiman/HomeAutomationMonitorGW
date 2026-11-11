@@ -24,16 +24,20 @@ type templateDocument struct {
 		} `yaml:"template_groups"`
 		Templates []struct {
 			Items []struct {
-				Name       string `yaml:"name"`
-				Type       string `yaml:"type"`
-				Key        string `yaml:"key"`
-				URL        string `yaml:"url"`
-				Delay      string `yaml:"delay"`
-				VerifyPeer string `yaml:"verify_peer"`
-				VerifyHost string `yaml:"verify_host"`
-				ValueType  string `yaml:"value_type"`
-				Units      string `yaml:"units"`
-				ValueMap   struct {
+				UUID        string `yaml:"uuid"`
+				Name        string `yaml:"name"`
+				Type        string `yaml:"type"`
+				Key         string `yaml:"key"`
+				URL         string `yaml:"url"`
+				StatusCodes string `yaml:"status_codes"`
+				Delay       string `yaml:"delay"`
+				History     string `yaml:"history"`
+				Trends      string `yaml:"trends"`
+				VerifyPeer  string `yaml:"verify_peer"`
+				VerifyHost  string `yaml:"verify_host"`
+				ValueType   string `yaml:"value_type"`
+				Units       string `yaml:"units"`
+				ValueMap    struct {
 					Name string `yaml:"name"`
 				} `yaml:"valuemap"`
 				MasterItem struct {
@@ -49,6 +53,7 @@ type templateDocument struct {
 					Parameters   []string `yaml:"parameters"`
 				} `yaml:"preprocessing"`
 				Triggers []struct {
+					UUID       string `yaml:"uuid"`
 					Name       string `yaml:"name"`
 					Expression string `yaml:"expression"`
 					Priority   string `yaml:"priority"`
@@ -143,14 +148,22 @@ func TestTemplateUsesNativeTokenPollAndKeepsTimestampPrototypesDisabled(t *testi
 		t.Fatal(err)
 	}
 	template := document.Export.Templates[0]
-	master := template.Items[0]
-	if master.Type != "HTTP_AGENT" || master.Delay != "{$AUTOMATION_GATEWAY_INTERVAL}" || !strings.HasSuffix(master.URL, "/api/v1/metrics/poll") {
-		t.Fatalf("master=%+v", master)
+	raw := template.Items[0]
+	if raw.Type != "HTTP_AGENT" || raw.Delay != "{$AUTOMATION_GATEWAY_INTERVAL}" || !strings.HasSuffix(raw.URL, "/api/v1/metrics/poll") {
+		t.Fatalf("raw poll master=%+v", raw)
 	}
-	if len(master.Preprocessing) != 1 || master.Preprocessing[0].ErrorHandler != "DISCARD_VALUE" {
-		t.Fatalf("master must discard empty sparse values: %+v", master.Preprocessing)
+	reachable := template.Items[1]
+	if reachable.Key != "automation.gateway.reachable" || reachable.Type != "DEPENDENT" || reachable.MasterItem.Key != raw.Key {
+		t.Fatalf("reachability heartbeat=%+v", reachable)
 	}
-	for _, item := range template.Items[1:] {
+	snapshot := template.Items[2]
+	if snapshot.Key != "automation.gateway.snapshot" || snapshot.Type != "DEPENDENT" || snapshot.MasterItem.Key != raw.Key {
+		t.Fatalf("validated snapshot=%+v", snapshot)
+	}
+	if len(snapshot.Preprocessing) != 2 || snapshot.Preprocessing[0].ErrorHandler != "DISCARD_VALUE" || snapshot.Preprocessing[1].Type != "DISCARD_UNCHANGED_HEARTBEAT" || len(snapshot.Preprocessing[1].Parameters) != 1 || snapshot.Preprocessing[1].Parameters[0] != "1m" {
+		t.Fatalf("snapshot must validate polls and heartbeat stable values: %+v", snapshot.Preprocessing)
+	}
+	for _, item := range template.Items[3:] {
 		for _, step := range item.Preprocessing {
 			if step.Type == "JSONPATH" && step.ErrorHandler != "DISCARD_VALUE" {
 				t.Fatalf("static item missing sparse value is not discarded: %s", item.Key)
@@ -175,7 +188,7 @@ func TestTemplateUsesNativeTokenPollAndKeepsTimestampPrototypesDisabled(t *testi
 			}
 			if strings.Contains(prototype.Key, ".timestamp[") {
 				found++
-				if prototype.Discover != "NO" || prototype.Status != "DISABLED" {
+				if prototype.Discover != "NO_DISCOVER" || prototype.Status != "DISABLED" {
 					t.Fatalf("timestamp prototype enabled: %+v", prototype)
 				}
 			}
@@ -183,6 +196,49 @@ func TestTemplateUsesNativeTokenPollAndKeepsTimestampPrototypesDisabled(t *testi
 	}
 	if found != 2 {
 		t.Fatalf("timestamp prototype count=%d", found)
+	}
+}
+
+func TestTemplateUsesOneRawPollRequestWithoutHealthRequest(t *testing.T) {
+	data, err := os.ReadFile("template_homeauthmonitorgw.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document templateDocument
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	template := document.Export.Templates[0]
+
+	httpAgents := 0
+	pollItems := 0
+	for _, item := range template.Items {
+		if item.Type == "HTTP_AGENT" {
+			httpAgents++
+		}
+		if strings.HasSuffix(item.URL, "/api/v1/metrics/poll") {
+			pollItems++
+			if item.Delay != "{$AUTOMATION_GATEWAY_INTERVAL}" {
+				t.Fatalf("poll delay=%q", item.Delay)
+			}
+		}
+		if strings.Contains(item.URL, "/health") {
+			t.Fatalf("unexpected health request item=%+v", item)
+		}
+	}
+	if httpAgents != 1 || pollItems != 1 {
+		t.Fatalf("HTTP-agent items=%d poll items=%d", httpAgents, pollItems)
+	}
+
+	macroValues := make(map[string]string, len(template.Macros))
+	for _, macro := range template.Macros {
+		macroValues[macro.Macro] = macro.Value
+	}
+	if macroValues["{$AUTOMATION_GATEWAY_INTERVAL}"] != "5s" {
+		t.Fatalf("poll interval=%q", macroValues["{$AUTOMATION_GATEWAY_INTERVAL}"])
+	}
+	if _, found := macroValues["{$AUTOMATION_GATEWAY_HEALTH_INTERVAL}"]; found {
+		t.Fatal("dedicated health interval macro must not exist")
 	}
 }
 
@@ -203,19 +259,52 @@ func TestTemplateUsesOneHTTPSMasterAndDependentDiscovery(t *testing.T) {
 		t.Fatalf("template groups=%+v", document.Export.TemplateGroups)
 	}
 	template := document.Export.Templates[0]
-	if len(template.Items) != 26 || template.Items[0].Type != "HTTP_AGENT" || template.Items[0].Key != "automation.gateway.snapshot" || !strings.HasSuffix(template.Items[0].URL, "/api/v1/metrics/poll") || template.Items[0].VerifyPeer != "YES" || template.Items[0].VerifyHost != "YES" {
+	if len(template.Items) != 28 {
 		t.Fatalf("master items=%+v", template.Items)
 	}
-	for _, item := range template.Items[1:] {
+	raw := template.Items[0]
+	if raw.UUID != "7e366154677f4a67babed24573fbb9aa" || raw.Type != "HTTP_AGENT" || raw.Key != "automation.gateway.poll.raw" || !strings.HasSuffix(raw.URL, "/api/v1/metrics/poll") || raw.StatusCodes != "200" || raw.History != "0" || raw.Trends != "0" || raw.ValueType != "TEXT" || raw.VerifyPeer != "YES" || raw.VerifyHost != "YES" {
+		t.Fatalf("raw poll item=%+v", raw)
+	}
+	if len(raw.Triggers) != 0 {
+		t.Fatalf("raw poll must not own triggers: %+v", raw.Triggers)
+	}
+	reachable := template.Items[1]
+	if reachable.UUID != "1611348b176f4235be3806b2187f07bb" || reachable.Key != "automation.gateway.reachable" || reachable.Type != "DEPENDENT" || reachable.MasterItem.Key != raw.Key || reachable.History != "7d" || reachable.Trends != "30d" || reachable.ValueType != "UNSIGNED" {
+		t.Fatalf("reachability item=%+v", reachable)
+	}
+	if len(reachable.Preprocessing) != 2 || reachable.Preprocessing[0].Type != "JAVASCRIPT" || len(reachable.Preprocessing[0].Parameters) != 1 || strings.TrimSpace(reachable.Preprocessing[0].Parameters[0]) != "return 1;" || reachable.Preprocessing[1].Type != "DISCARD_UNCHANGED_HEARTBEAT" || len(reachable.Preprocessing[1].Parameters) != 1 || reachable.Preprocessing[1].Parameters[0] != "1m" {
+		t.Fatalf("reachability preprocessing=%+v", reachable.Preprocessing)
+	}
+	if len(reachable.Triggers) != 1 || reachable.Triggers[0].UUID != "722e5bc23d8845e69a5ba6bc2427fffd" || !strings.Contains(reachable.Triggers[0].Expression, "automation.gateway.reachable,5m") {
+		t.Fatalf("reachability trigger=%+v", reachable.Triggers)
+	}
+	snapshot := template.Items[2]
+	if snapshot.UUID != "a70ce834f05e40b3afc07eaf63b44e9c" || snapshot.Key != "automation.gateway.snapshot" || snapshot.Type != "DEPENDENT" || snapshot.MasterItem.Key != raw.Key || snapshot.History != "1d" || snapshot.Trends != "0" {
+		t.Fatalf("validated snapshot=%+v", snapshot)
+	}
+	if len(snapshot.Triggers) != 1 || snapshot.Triggers[0].UUID != "5636d500de234116b388f549d094452d" || !strings.Contains(snapshot.Triggers[0].Expression, "automation.gateway.snapshot,5m") {
+		t.Fatalf("snapshot validity trigger=%+v", snapshot.Triggers)
+	}
+	pollReaders := 0
+	for _, item := range template.Items {
+		if strings.HasSuffix(item.URL, "/api/v1/metrics/poll") {
+			pollReaders++
+		}
+	}
+	if pollReaders != 1 {
+		t.Fatalf("poll reader count=%d", pollReaders)
+	}
+	for _, item := range template.Items[3:] {
 		if item.Type != "DEPENDENT" || item.URL != "" || item.MasterItem.Key != "automation.gateway.snapshot" {
 			t.Fatalf("device item is not dependent-only: %+v", item)
 		}
 	}
-	if len(template.Items[0].Headers) != 1 || template.Items[0].Headers[0].Name != "Authorization" || template.Items[0].Headers[0].Value != "Bearer {$AUTOMATION_GATEWAY_TOKEN}" {
-		t.Fatalf("headers=%+v", template.Items[0].Headers)
+	if len(raw.Headers) != 1 || raw.Headers[0].Name != "Authorization" || raw.Headers[0].Value != "Bearer {$AUTOMATION_GATEWAY_TOKEN}" {
+		t.Fatalf("headers=%+v", raw.Headers)
 	}
-	if len(template.Items[0].Preprocessing) != 1 || template.Items[0].Preprocessing[0].Type != "JAVASCRIPT" || len(template.Items[0].Preprocessing[0].Parameters) != 1 {
-		t.Fatalf("master preprocessing=%+v", template.Items[0].Preprocessing)
+	if len(raw.Preprocessing) != 0 || len(snapshot.Preprocessing) != 2 || snapshot.Preprocessing[0].Type != "JAVASCRIPT" || len(snapshot.Preprocessing[0].Parameters) != 1 {
+		t.Fatalf("raw preprocessing=%+v snapshot preprocessing=%+v", raw.Preprocessing, snapshot.Preprocessing)
 	}
 	if len(template.DiscoveryRules) != 3 {
 		t.Fatalf("discovery rules=%d", len(template.DiscoveryRules))
@@ -294,7 +383,7 @@ func TestTemplateUUIDsAreUnique(t *testing.T) {
 		}
 	}
 	visit(&root)
-	if len(seen) != 55 {
+	if len(seen) != 58 {
 		t.Fatalf("UUID count=%d", len(seen))
 	}
 }
@@ -376,8 +465,8 @@ func TestDiscoveryJavaScriptTransformsSnapshot(t *testing.T) {
 	}
 }
 
-// TestMasterJavaScriptRejectsInvalidPayloads verifies HTTP 200 alone cannot keep monitoring supported.
-func TestMasterJavaScriptRejectsInvalidPayloads(t *testing.T) {
+// TestSnapshotJavaScriptRejectsInvalidRawHTTP200Payloads verifies reachability does not imply valid data.
+func TestSnapshotJavaScriptRejectsInvalidRawHTTP200Payloads(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node is not installed")
@@ -390,30 +479,53 @@ func TestMasterJavaScriptRejectsInvalidPayloads(t *testing.T) {
 	if err := yaml.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	script := "const value = process.argv[1]; function transform() {\n" + document.Export.Templates[0].Items[0].Preprocessing[0].Parameters[0] + "\n} process.stdout.write(transform());"
+	reachableBody := document.Export.Templates[0].Items[1].Preprocessing[0].Parameters[0]
+	snapshotBody := document.Export.Templates[0].Items[2].Preprocessing[0].Parameters[0]
+	run := func(body, input string) ([]byte, error) {
+		script := "const value = process.argv[1]; function transform() {\n" + body + "\n} process.stdout.write(String(transform()));"
+		return exec.Command(node, "-e", script, input).CombinedOutput()
+	}
 	legacy := `{"source-one":{"name":"source-one","driver":"nut","available":false,"stale":true,"last_success":"0001-01-01T00:00:00Z","unavailable_since":"2026-10-07T12:00:00Z","metrics":[]},"__poll_mode":"full"}`
-	valid := `{"schema_version":1,"mode":"full","generation":"test","cursor":"v1.test.1","captured_at":"2026-10-07T12:00:00Z","sources":[{"name":"source-one","driver":"nut","available":false,"stale":true,"last_success":"0001-01-01T00:00:00Z","unavailable_since":"2026-10-07T12:00:00Z","metrics":[]}]}`
-	output, err := exec.Command(node, "-e", script, valid).CombinedOutput()
+	valid := `{"schema_version":1,"mode":"full","generation":"AAAAAAAAAAAAAAAAAAAAAA","cursor":"v1.AAAAAAAAAAAAAAAAAAAAAA.1","captured_at":"2026-10-07T12:00:00Z","sources":[{"name":"source-one","driver":"nut","available":false,"stale":true,"last_success":"0001-01-01T00:00:00Z","unavailable_since":"2026-10-07T12:00:00Z","metrics":[]}]}`
+	output, err := run(snapshotBody, valid)
 	if err != nil || string(output) != legacy {
 		t.Fatalf("valid payload: %v output=%q", err, output)
 	}
-	invalid := []string{
-		`not JSON`,
-		`[]`,
-		`{"bad/source":{"driver":"nut","available":true,"stale":false,"last_success":"x","metrics":[]}}`,
-		`{"source-one":{"driver":"nut","available":"yes","stale":false,"last_success":"2026-10-04T00:00:00Z","metrics":[]}}`,
-		`{"source-one":{"driver":"nut","available":true,"stale":false,"last_success":"not-a-time","metrics":[]}}`,
-		`{"source-one":{"driver":"nut","available":true,"stale":false,"last_success":"2026-10-04T00:00:00Z","metrics":[{"name":"bad-time","value":1,"value_type":"number","timestamp":"not-a-time"}]}}`,
-		`{"source-one":{"driver":"nut","available":true,"stale":false,"last_success":"2026-10-04T00:00:00Z","metrics":[{"name":"missing-fields"}]}}`,
+	invalid := []struct {
+		name    string
+		payload string
+	}{
+		{"not JSON", `not JSON`},
+		{"array", `[]`},
+		{"missing generation", `{"schema_version":1,"mode":"sparse","cursor":"v1.AAAAAAAAAAAAAAAAAAAAAA.1","captured_at":"2026-10-07T12:00:00Z","sources":[]}`},
+		{"empty generation", `{"schema_version":1,"mode":"sparse","generation":"","cursor":"v1.AAAAAAAAAAAAAAAAAAAAAA.1","captured_at":"2026-10-07T12:00:00Z","sources":[]}`},
+		{"invalid generation", `{"schema_version":1,"mode":"sparse","generation":"not-a-generation","cursor":"v1.AAAAAAAAAAAAAAAAAAAAAA.1","captured_at":"2026-10-07T12:00:00Z","sources":[]}`},
+		{"missing cursor", `{"schema_version":1,"mode":"sparse","generation":"AAAAAAAAAAAAAAAAAAAAAA","captured_at":"2026-10-07T12:00:00Z","sources":[]}`},
+		{"empty cursor", `{"schema_version":1,"mode":"sparse","generation":"AAAAAAAAAAAAAAAAAAAAAA","cursor":"","captured_at":"2026-10-07T12:00:00Z","sources":[]}`},
+		{"invalid cursor", `{"schema_version":1,"mode":"sparse","generation":"AAAAAAAAAAAAAAAAAAAAAA","cursor":"bogus","captured_at":"2026-10-07T12:00:00Z","sources":[]}`},
+		{"cursor generation mismatch", `{"schema_version":1,"mode":"sparse","generation":"AAAAAAAAAAAAAAAAAAAAAA","cursor":"v1.BBBBBBBBBBBBBBBBBBBBBE.1","captured_at":"2026-10-07T12:00:00Z","sources":[]}`},
+		{"missing captured_at", `{"schema_version":1,"mode":"sparse","generation":"AAAAAAAAAAAAAAAAAAAAAA","cursor":"v1.AAAAAAAAAAAAAAAAAAAAAA.1","sources":[]}`},
+		{"empty captured_at", `{"schema_version":1,"mode":"sparse","generation":"AAAAAAAAAAAAAAAAAAAAAA","cursor":"v1.AAAAAAAAAAAAAAAAAAAAAA.1","captured_at":"","sources":[]}`},
+		{"invalid captured_at", `{"schema_version":1,"mode":"sparse","generation":"AAAAAAAAAAAAAAAAAAAAAA","cursor":"v1.AAAAAAAAAAAAAAAAAAAAAA.1","captured_at":"not-time","sources":[]}`},
+		{"invalid mode", `{"schema_version":1,"mode":"delta","generation":"AAAAAAAAAAAAAAAAAAAAAA","cursor":"v1.AAAAAAAAAAAAAAAAAAAAAA.1","captured_at":"2026-10-07T12:00:00Z","sources":[]}`},
+		{"missing mode", `{"schema_version":1,"generation":"AAAAAAAAAAAAAAAAAAAAAA","cursor":"v1.AAAAAAAAAAAAAAAAAAAAAA.1","captured_at":"2026-10-07T12:00:00Z","sources":[]}`},
+		{"invalid schema version", `{"schema_version":2,"mode":"sparse","generation":"AAAAAAAAAAAAAAAAAAAAAA","cursor":"v1.AAAAAAAAAAAAAAAAAAAAAA.1","captured_at":"2026-10-07T12:00:00Z","sources":[]}`},
+		{"missing schema version", `{"mode":"sparse","generation":"AAAAAAAAAAAAAAAAAAAAAA","cursor":"v1.AAAAAAAAAAAAAAAAAAAAAA.1","captured_at":"2026-10-07T12:00:00Z","sources":[]}`},
+		{"legacy snapshot", `{"bad/source":{"driver":"nut","available":true,"stale":false,"last_success":"x","metrics":[]}}`},
 	}
-	for _, payload := range invalid {
-		if output, err := exec.Command(node, "-e", script, payload).CombinedOutput(); err == nil {
-			t.Fatalf("accepted payload %q with output %q", payload, output)
-		}
+	for _, fixture := range invalid {
+		t.Run(fixture.name, func(t *testing.T) {
+			if output, err := run(reachableBody, fixture.payload); err != nil || string(output) != "1" {
+				t.Fatalf("reachability rejected raw HTTP body: %v output=%q", err, output)
+			}
+			if output, err := run(snapshotBody, fixture.payload); err == nil {
+				t.Fatalf("accepted malformed envelope with output %q", output)
+			}
+		})
 	}
 }
 
-func TestMasterJavaScriptProjectsSparseChangesAndDiscoveryRejectsThem(t *testing.T) {
+func TestSnapshotJavaScriptProjectsSparseChangesAndDiscoveryRejectsThem(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node is not installed")
@@ -426,12 +538,12 @@ func TestMasterJavaScriptProjectsSparseChangesAndDiscoveryRejectsThem(t *testing
 	if err := yaml.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	masterBody := document.Export.Templates[0].Items[0].Preprocessing[0].Parameters[0]
+	masterBody := document.Export.Templates[0].Items[2].Preprocessing[0].Parameters[0]
 	run := func(body, input string) ([]byte, error) {
 		script := "const value = process.argv[1]; function transform() {\n" + body + "\n} process.stdout.write(transform());"
 		return exec.Command(node, "-e", script, input).CombinedOutput()
 	}
-	sparse := `{"schema_version":1,"mode":"sparse","generation":"test","cursor":"v1.test.2","captured_at":"2026-10-07T12:00:05Z","sources":[{"name":"source-one","status":{"name":"source-one","driver":"test","available":true,"stale":false,"last_success":"2026-10-07T12:00:05Z","unavailable_since":"0001-01-01T00:00:00Z","poll_duration_ns":1},"metrics":[{"operation":"upsert","identity":"a","metric":{"identity":"a","name":"a","value":3,"value_type":"number","timestamp":"2026-10-07T12:00:05Z"}}]}]}`
+	sparse := `{"schema_version":1,"mode":"sparse","generation":"AAAAAAAAAAAAAAAAAAAAAA","cursor":"v1.AAAAAAAAAAAAAAAAAAAAAA.2","captured_at":"2026-10-07T12:00:05Z","sources":[{"name":"source-one","status":{"name":"source-one","driver":"test","available":true,"stale":false,"last_success":"2026-10-07T12:00:05Z","unavailable_since":"0001-01-01T00:00:00Z","poll_duration_ns":1},"metrics":[{"operation":"upsert","identity":"a","metric":{"identity":"a","name":"a","value":3,"value_type":"number","timestamp":"2026-10-07T12:00:05Z"}}]}]}`
 	output, err := run(masterBody, sparse)
 	if err != nil {
 		t.Fatalf("sparse transform: %v: %s", err, output)
@@ -444,13 +556,66 @@ func TestMasterJavaScriptProjectsSparseChangesAndDiscoveryRejectsThem(t *testing
 	if projected["__poll_mode"] != "sparse" || len(source["metrics"].([]any)) != 1 || projected["__state"] != nil {
 		t.Fatalf("sparse projection=%v", projected)
 	}
-	empty := `{"schema_version":1,"mode":"sparse","generation":"test","cursor":"v1.test.2","captured_at":"2026-10-07T12:00:05Z","sources":[]}`
-	if output, err := run(masterBody, empty); err == nil {
-		t.Fatalf("empty sparse accepted: %s", output)
+	empty := `{"schema_version":1,"mode":"sparse","generation":"AAAAAAAAAAAAAAAAAAAAAA","cursor":"v1.AAAAAAAAAAAAAAAAAAAAAA.2","captured_at":"2026-10-07T12:00:05Z","sources":[]}`
+	emptyOutput, err := run(masterBody, empty)
+	if err != nil || string(emptyOutput) != `{"__poll_mode":"empty"}` {
+		t.Fatalf("valid empty sparse projection: %v output=%s", err, emptyOutput)
+	}
+	emptyFull := `{"schema_version":1,"mode":"full","generation":"AAAAAAAAAAAAAAAAAAAAAA","cursor":"v1.AAAAAAAAAAAAAAAAAAAAAA.2","captured_at":"2026-10-07T12:00:05Z","sources":[]}`
+	emptyFullOutput, err := run(masterBody, emptyFull)
+	if err != nil || string(emptyFullOutput) != `{"__poll_mode":"full"}` {
+		t.Fatalf("empty full inventory must remain consumable for reconciliation: %v output=%s", err, emptyFullOutput)
 	}
 	for _, rule := range document.Export.Templates[0].DiscoveryRules {
-		if output, err := run(rule.Preprocessing[0].Parameters[0], string(output)); err == nil {
-			t.Fatalf("rule %q accepted sparse projection: %s", rule.Key, output)
+		if output, err := run(rule.Preprocessing[0].Parameters[0], string(emptyOutput)); err == nil {
+			t.Fatalf("rule %q accepted empty sparse projection: %s", rule.Key, output)
+		}
+		if output, err := run(rule.Preprocessing[0].Parameters[0], string(emptyFullOutput)); err != nil || string(output) != "[]" {
+			t.Fatalf("rule %q did not consume empty full inventory: %v output=%s", rule.Key, err, output)
+		}
+	}
+}
+
+func TestEmptyPollSentinelIsDiscardedByEveryDependentPath(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
+	data, err := os.ReadFile("template_homeauthmonitorgw.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document templateDocument
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	const sentinel = `{"__poll_mode":"empty"}`
+	for _, item := range document.Export.Templates[0].Items[3:] {
+		if len(item.Preprocessing) == 0 {
+			t.Fatalf("dependent item %q has no preprocessing", item.Key)
+		}
+		first := item.Preprocessing[0]
+		if first.ErrorHandler != "DISCARD_VALUE" {
+			t.Fatalf("dependent item %q does not discard empty input", item.Key)
+		}
+		if first.Type == "JSONPATH" {
+			continue
+		}
+		if first.Type != "JAVASCRIPT" || len(first.Parameters) != 1 {
+			t.Fatalf("unsupported first preprocessing for %q: %+v", item.Key, first)
+		}
+		body := strings.NewReplacer(
+			"{$WAGO_SOURCE}", "wago",
+			"{$PHOENIX_SOURCE}", "phoenix",
+			"{$PHOENIX_BATTERY_CRITICAL}", "20",
+			"{$PHOENIX_BATTERY_WARNING}", "50",
+			"{$PHOENIX_TEMPERATURE_CRITICAL}", "55",
+			"{$PHOENIX_TEMPERATURE_WARNING}", "45",
+			"{$WAGO_MODULE_DESCRIPTIONS}", `{}`,
+		).Replace(first.Parameters[0])
+		script := "const value = process.argv[1]; function transform() {\n" + body + "\n} process.stdout.write(String(transform()));"
+		if output, err := exec.Command(node, "-e", script, sentinel).CombinedOutput(); err == nil {
+			t.Fatalf("dependent item %q accepted empty sentinel: %s", item.Key, output)
 		}
 	}
 }
@@ -486,7 +651,7 @@ func TestCompositeJavaScriptRejectsSparseWhileOrdinaryMetricUsesOnlyItsChange(t 
 	}
 	envelope := func(metric string, value any) string {
 		body, err := json.Marshal(map[string]any{
-			"schema_version": 1, "mode": "sparse", "generation": "test", "cursor": "v1.test.2", "captured_at": "2026-10-07T12:00:05Z",
+			"schema_version": 1, "mode": "sparse", "generation": "AAAAAAAAAAAAAAAAAAAAAA", "cursor": "v1.AAAAAAAAAAAAAAAAAAAAAA.2", "captured_at": "2026-10-07T12:00:05Z",
 			"sources": []any{map[string]any{
 				"name": "wago", "status": map[string]any{"name": "wago", "driver": "snmp", "available": true, "stale": false, "last_success": "2026-10-07T12:00:05Z", "unavailable_since": "0001-01-01T00:00:00Z", "poll_duration_ns": 1},
 				"metrics": []any{map[string]any{"operation": "upsert", "identity": metric, "metric": map[string]any{"name": metric, "value": value, "value_type": "string", "timestamp": "2026-10-07T12:00:05Z"}}},
@@ -746,6 +911,7 @@ func TestWAGOProjectAndModuleInventory(t *testing.T) {
 			Parameters   []string `yaml:"parameters"`
 		}
 		triggers []struct {
+			UUID       string `yaml:"uuid"`
 			Name       string `yaml:"name"`
 			Expression string `yaml:"expression"`
 			Priority   string `yaml:"priority"`
@@ -760,6 +926,7 @@ func TestWAGOProjectAndModuleInventory(t *testing.T) {
 				Parameters   []string `yaml:"parameters"`
 			}
 			triggers []struct {
+				UUID       string `yaml:"uuid"`
 				Name       string `yaml:"name"`
 				Expression string `yaml:"expression"`
 				Priority   string `yaml:"priority"`

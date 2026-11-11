@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -56,10 +57,21 @@ type API struct {
 
 type pollState struct {
 	mu          sync.Mutex
+	version     uint64
 	initialized bool
 	generation  string
 	cursor      string
 	lastFull    time.Time
+	known       map[string]struct{}
+}
+
+type pollStateSnapshot struct {
+	version     uint64
+	initialized bool
+	generation  string
+	cursor      string
+	lastFull    time.Time
+	known       map[string]struct{}
 }
 
 type pollEnvelope struct {
@@ -365,56 +377,73 @@ func (a *API) deltaMetrics(w http.ResponseWriter, r *http.Request, store *cache.
 	}
 }
 
-// pollMetrics advances one authenticated reader's in-memory cursor and returns a full snapshot or collapsed latest-state delta.
+// pollMetrics computes one authenticated reader response without holding its lock across I/O and commits progress after a successful local write and flush.
 func (a *API) pollMetrics(w http.ResponseWriter, view View, identity [sha256.Size]byte) {
 	state := a.pollState(identity, view.TokenDigests)
 	state.mu.Lock()
+	previous := pollStateSnapshot{version: state.version, initialized: state.initialized, generation: state.generation, cursor: state.cursor, lastFull: state.lastFull, known: cloneIdentitySet(state.known)}
+	state.mu.Unlock()
 	now := a.options.Now().UTC()
 	interval := view.PollFullInterval
 	if interval <= 0 {
 		interval = 10 * time.Minute
 	}
-	if !state.initialized {
-		response := buildPollFull(view.Store, state, "first_request", now)
-		state.mu.Unlock()
-		writeJSON(w, http.StatusOK, response)
+	response, next, err := buildPollResponse(view.Store, previous, now, interval)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "poll delta unavailable")
 		return
 	}
-	if now.Sub(state.lastFull) >= interval {
-		response := buildPollFull(view.Store, state, "periodic", now)
-		state.mu.Unlock()
-		writeJSON(w, http.StatusOK, response)
+	if err := writePollJSON(w, response); err != nil {
 		return
+	}
+	state.mu.Lock()
+	if state.version == previous.version {
+		state.initialized = next.initialized
+		state.generation = next.generation
+		state.cursor = next.cursor
+		state.lastFull = next.lastFull
+		state.known = cloneIdentitySet(next.known)
+		state.version++
+	}
+	state.mu.Unlock()
+}
+
+func buildPollResponse(store *cache.Store, previous pollStateSnapshot, now time.Time, interval time.Duration) (pollEnvelope, pollStateSnapshot, error) {
+	if !previous.initialized {
+		response, next := buildPollFull(store, previous, "first_request", now)
+		return response, next, nil
+	}
+	if now.Sub(previous.lastFull) >= interval {
+		response, next := buildPollFull(store, previous, "periodic", now)
+		return response, next, nil
 	}
 
 	latest := make(map[string]*sparseSource)
-	cursor := state.cursor
+	cursor := previous.cursor
 	for {
-		delta, err := view.Store.Delta(cursor)
+		delta, err := store.Delta(cursor)
 		if err != nil {
 			if errors.Is(err, cache.ErrCursorGeneration) || errors.Is(err, cache.ErrCursorExpired) || errors.Is(err, cache.ErrCursorFuture) {
-				response := buildPollFull(view.Store, state, "reset_required", now)
-				state.mu.Unlock()
-				writeJSON(w, http.StatusOK, response)
-				return
+				response, next := buildPollFull(store, previous, "reset_required", now)
+				return response, next, nil
 			}
-			state.mu.Unlock()
-			writeError(w, http.StatusInternalServerError, "poll delta unavailable")
-			return
+			return pollEnvelope{}, previous, err
 		}
 		for _, transaction := range delta.Transactions {
 			if transaction.DiscoveryChanged {
-				response := buildPollFull(view.Store, state, "discovery_changed", now)
-				state.mu.Unlock()
-				writeJSON(w, http.StatusOK, response)
-				return
+				response, next := buildPollFull(store, previous, "discovery_changed", now)
+				return response, next, nil
 			}
 			for _, record := range transaction.Metrics {
 				if record.Operation == "remove" {
-					response := buildPollFull(view.Store, state, "metric_removed", now)
-					state.mu.Unlock()
-					writeJSON(w, http.StatusOK, response)
-					return
+					response, next := buildPollFull(store, previous, "metric_removed", now)
+					return response, next, nil
+				}
+				if record.Operation == "upsert" {
+					if _, known := previous.known[metricIdentityKey(transaction.Source, record.Identity)]; !known {
+						response, next := buildPollFull(store, previous, "metric_added", now)
+						return response, next, nil
+					}
 				}
 			}
 			source := latest[transaction.Source]
@@ -454,19 +483,62 @@ func (a *API) pollMetrics(w http.ResponseWriter, view View, identity [sha256.Siz
 	for _, name := range names {
 		sources = append(sources, *latest[name])
 	}
-	state.cursor = cursor
-	response := pollEnvelope{SchemaVersion: 1, Mode: "sparse", Generation: state.generation, Cursor: cursor, CapturedAt: now, Sources: sources}
-	state.mu.Unlock()
-	writeJSON(w, http.StatusOK, response)
+	next := previous
+	next.cursor = cursor
+	response := pollEnvelope{SchemaVersion: 1, Mode: "sparse", Generation: previous.generation, Cursor: cursor, CapturedAt: now, Sources: sources}
+	return response, next, nil
 }
 
-func buildPollFull(store *cache.Store, state *pollState, reason string, now time.Time) pollEnvelope {
+func buildPollFull(store *cache.Store, previous pollStateSnapshot, reason string, now time.Time) (pollEnvelope, pollStateSnapshot) {
 	full := store.Full()
-	state.initialized = true
-	state.generation = full.Generation
-	state.cursor = full.Cursor
-	state.lastFull = now
-	return pollEnvelope{SchemaVersion: 1, Mode: "full", Reason: reason, Generation: full.Generation, Cursor: full.Cursor, CapturedAt: full.CapturedAt, Sources: full.Sources}
+	next := previous
+	next.initialized = true
+	next.generation = full.Generation
+	next.cursor = full.Cursor
+	next.lastFull = now
+	next.known = make(map[string]struct{})
+	for _, source := range full.Sources {
+		for _, metric := range source.Metrics {
+			identity := metric.Identity
+			if identity == "" {
+				identity = metric.Name
+			}
+			next.known[metricIdentityKey(source.Name, identity)] = struct{}{}
+		}
+	}
+	return pollEnvelope{SchemaVersion: 1, Mode: "full", Reason: reason, Generation: full.Generation, Cursor: full.Cursor, CapturedAt: full.CapturedAt, Sources: full.Sources}, next
+}
+
+func metricIdentityKey(source, identity string) string {
+	return source + "\x00" + identity
+}
+
+func cloneIdentitySet(in map[string]struct{}) map[string]struct{} {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]struct{}, len(in))
+	for identity := range in {
+		out[identity] = struct{}{}
+	}
+	return out
+}
+
+func writePollJSON(w http.ResponseWriter, response pollEnvelope) error {
+	body, err := json.Marshal(response)
+	if err != nil {
+		return err
+	}
+	body = append(body, '\n')
+	w.WriteHeader(http.StatusOK)
+	written, err := w.Write(body)
+	if err != nil {
+		return err
+	}
+	if written != len(body) {
+		return io.ErrShortWrite
+	}
+	return http.NewResponseController(w).Flush()
 }
 
 func (a *API) pollState(identity [sha256.Size]byte, configured [][sha256.Size]byte) *pollState {

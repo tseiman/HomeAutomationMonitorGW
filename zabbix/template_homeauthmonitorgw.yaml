@@ -7,18 +7,19 @@ zabbix_export:
     - uuid: 60d4f3523b094da0a49b477eba03ee37
       template: 'Template HomeAuthMonitorGW by HTTP'
       name: 'Template HomeAuthMonitorGW by HTTP'
-      description: 'Read-only monitoring through one authenticated HomeAuthMonitorGW HTTPS cache snapshot.'
+      description: 'Read-only monitoring through one authenticated sparse poll, with raw reachability and dependent envelope validation.'
       groups:
         - name: Templates/HomeAuthMonitorGW
       items:
-        - uuid: a70ce834f05e40b3afc07eaf63b44e9c
-          name: 'Automation gateway snapshot'
+        - uuid: 7e366154677f4a67babed24573fbb9aa
+          name: 'Automation gateway raw poll'
           type: HTTP_AGENT
-          key: automation.gateway.snapshot
+          key: automation.gateway.poll.raw
           delay: '{$AUTOMATION_GATEWAY_INTERVAL}'
-          history: '1d'
+          history: '0'
           trends: '0'
           value_type: TEXT
+          description: 'Raw authenticated HTTP 200 response from the poll endpoint. History is disabled so changing payloads are never written to the database; dependent items consume each accepted value.'
           url: '{$AUTOMATION_GATEWAY_URL}/api/v1/metrics/poll'
           status_codes: '200'
           follow_redirects: 'NO'
@@ -30,18 +31,78 @@ zabbix_export:
           headers:
             - name: Authorization
               value: 'Bearer {$AUTOMATION_GATEWAY_TOKEN}'
+        - uuid: 1611348b176f4235be3806b2187f07bb
+          name: 'Automation gateway reachable'
+          type: DEPENDENT
+          key: automation.gateway.reachable
+          history: '7d'
+          trends: '30d'
+          value_type: UNSIGNED
+          description: 'Accepted raw HTTP poll heartbeat. Every accepted HTTP 200 value becomes 1 without parsing its body; unchanged values are stored at most once per minute.'
+          master_item:
+            key: automation.gateway.poll.raw
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - 'return 1;'
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1m
+          tags:
+            - tag: component
+              value: gateway
+            - tag: scope
+              value: availability
+          triggers:
+            - uuid: 722e5bc23d8845e69a5ba6bc2427fffd
+              expression: 'nodata(/Template HomeAuthMonitorGW by HTTP/automation.gateway.reachable,5m)=1'
+              name: 'Automation gateway HTTPS is not reachable for 5 minutes'
+              priority: HIGH
+              description: 'The authenticated poll endpoint has returned no accepted HTTP 200 response for five minutes. Check gateway availability, TLS, allowlist, and token.'
+        - uuid: a70ce834f05e40b3afc07eaf63b44e9c
+          name: 'Automation gateway snapshot'
+          type: DEPENDENT
+          key: automation.gateway.snapshot
+          history: '1d'
+          trends: '0'
+          value_type: TEXT
+          description: 'Validated full, sparse, or empty poll projection used by all metric, source, and discovery dependent items.'
+          master_item:
+            key: automation.gateway.poll.raw
           preprocessing:
             - type: JAVASCRIPT
               error_handler: DISCARD_VALUE
               parameters:
                 - |
                   var response = JSON.parse(value);
-                  if (!response || Array.isArray(response) || typeof response !== 'object' || response.schema_version !== 1 || (response.mode !== 'full' && response.mode !== 'sparse') || !Array.isArray(response.sources) || typeof response.cursor !== 'string') {
+                  function isRFC3339(timestamp) {
+                      if (typeof timestamp !== 'string') return false;
+                      var match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/.exec(timestamp);
+                      if (!match) return false;
+                      var year = Number(match[1]);
+                      var month = Number(match[2]);
+                      var day = Number(match[3]);
+                      var hour = Number(match[4]);
+                      var minute = Number(match[5]);
+                      var second = Number(match[6]);
+                      var leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+                      var days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+                      if (month < 1 || month > 12 || day < 1 || day > days[month - 1] || hour > 23 || minute > 59 || second > 59) return false;
+                      if (match[7] !== 'Z') {
+                          var offset = match[7].slice(1).split(':');
+                          if (Number(offset[0]) > 23 || Number(offset[1]) > 59) return false;
+                      }
+                      return true;
+                  }
+                  var generationPattern = /^[A-Za-z0-9_-]{21}[AEIMQUYcgkosw048]$/;
+                  var cursorPattern = /^v1\.([A-Za-z0-9_-]{21}[AEIMQUYcgkosw048])\.(0|[1-9][0-9]*)$/;
+                  var cursorMatch = typeof response.cursor === 'string' ? cursorPattern.exec(response.cursor) : null;
+                  if (!response || Array.isArray(response) || typeof response !== 'object' || response.schema_version !== 1 || (response.mode !== 'full' && response.mode !== 'sparse') || !Array.isArray(response.sources) || typeof response.generation !== 'string' || !generationPattern.test(response.generation) || !cursorMatch || cursorMatch[1] !== response.generation || !isRFC3339(response.captured_at)) {
                       throw 'poll envelope is invalid';
                   }
-                  if (response.mode === 'sparse' && response.sources.length === 0) {
-                      throw 'empty sparse poll';
-                  }
+                  // Only a sparse empty poll is a no-change sentinel. An empty full poll
+                  // must remain full so discovery can reconcile every removed entity.
+                  if (response.mode === 'sparse' && response.sources.length === 0) return JSON.stringify({__poll_mode: 'empty'});
                   function indexSources(sources) {
                       var indexed = {};
                       sources.forEach(function (source) {
@@ -87,15 +148,18 @@ zabbix_export:
                   });
                   snapshot.__poll_mode = response.mode;
                   return JSON.stringify(snapshot);
+            - type: DISCARD_UNCHANGED_HEARTBEAT
+              parameters:
+                - 1m
           tags:
             - tag: component
               value: gateway
           triggers:
-            - uuid: 722e5bc23d8845e69a5ba6bc2427fffd
+            - uuid: 5636d500de234116b388f549d094452d
               expression: 'nodata(/Template HomeAuthMonitorGW by HTTP/automation.gateway.snapshot,5m)=1'
-              name: 'Automation gateway has no snapshot data for 5 minutes'
+              name: 'Automation gateway has no valid poll data for 5 minutes'
               priority: HIGH
-              description: 'The authenticated HTTPS master item has produced no value for five minutes. Check TLS, allowlist, token, and gateway availability.'
+              description: 'The dependent snapshot has produced no syntactically and semantically valid poll envelope for five minutes. Raw HTTP reachability is monitored separately.'
         - uuid: 1e0f1d2b76894e31ad44529eb2f21f4d
           name: 'TS Service health: HeimAuto'
           type: DEPENDENT
@@ -1277,7 +1341,7 @@ zabbix_export:
               name: 'Source {#SOURCE}: metric {#METRIC} timestamp'
               type: DEPENDENT
               key: 'automation.gateway.metric.timestamp["{#SOURCE}","{#METRIC_KEY}"]'
-              discover: NO
+              discover: NO_DISCOVER
               status: DISABLED
               history: '7d'
               trends: '30d'
@@ -1403,7 +1467,7 @@ zabbix_export:
               name: 'Source {#SOURCE}: metric {#METRIC} timestamp'
               type: DEPENDENT
               key: 'automation.gateway.metric.numeric.timestamp["{#SOURCE}","{#METRIC_KEY}"]'
-              discover: NO
+              discover: NO_DISCOVER
               status: DISABLED
               history: '7d'
               trends: '30d'

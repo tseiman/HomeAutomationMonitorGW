@@ -34,7 +34,7 @@ Every API client needs both:
 
 Assign one distinct token to each logical polling reader. The token digest identifies that reader's in-memory poll cursor; raw tokens are never returned or logged.
 
-For Zabbix, allow the server or proxy address. Import [`zabbix/template_homeauthmonitorgw.yaml`](zabbix/template_homeauthmonitorgw.yaml), set its gateway URL and dedicated secret token, and keep certificate peer and hostname verification enabled. One native HTTP-agent master polls `/api/v1/metrics/poll` every 5 seconds. It receives a full snapshot initially and at least every `delta.poll_full_interval` (default 10 minutes), with latest-state sparse changes between full responses. Package installation never imports the template or changes Zabbix.
+For Zabbix, allow the server or proxy address. Import [`zabbix/template_homeauthmonitorgw.yaml`](zabbix/template_homeauthmonitorgw.yaml), set its gateway URL and dedicated secret token, and keep certificate peer and hostname verification enabled. Exactly one native HTTP-agent item polls `/api/v1/metrics/poll` every 5 seconds. Its changing raw payload is not stored. Instead, `automation.gateway.reachable` derives a constant `1` from every accepted HTTP 200 value and stores an unchanged heartbeat at most once a minute, so reachability needs no second request and remains true even if the body is malformed. The stable `automation.gateway.snapshot` dependent item separately validates and projects the poll envelope for all existing dependents. The poll receives a full snapshot initially, when a new metric identity appears, and at least every `delta.poll_full_interval` (default 10 minutes), with latest-state sparse changes between full responses. Valid empty sparse polls become a stable heartbeat sentinel, while malformed envelopes are discarded by the snapshot. No additional health request is made. Package installation never imports or changes Zabbix.
 
 ## Validate and operate
 
@@ -64,7 +64,7 @@ A cursor-capable client owns its cursor:
 4. continue immediately while `has_more` is true;
 5. poll later from the last applied cursor.
 
-Retry a failed or ambiguous generic delta request with the same cursor. Multiple readers may bootstrap at different cursors and replay independently. On `410 Gone`, or `409 Conflict` with `reset_required: true`, discard incremental state and take a new full snapshot. Native `/metrics/poll` has no acknowledgement: intermediate changes may collapse to the latest value, and uncertain delivery is repaired by the next periodic full response. It is not a lossless history transport and does not preserve every original history timestamp.
+Retry a failed or ambiguous generic delta request with the same cursor. Multiple readers may bootstrap at different cursors and replay independently. On `410 Gone`, or `409 Conflict` with `reset_required: true`, discard incremental state and take a new full snapshot. Native `/metrics/poll` commits token progress only after its response is encoded, completely written, and locally flushed; a local write failure therefore replays the same current-state change or full response. There is still no end-to-end acknowledgement: a transport failure after a successful local flush is ambiguous, intermediate changes may collapse to the latest value, and the periodic full response repairs uncertain state. It is not a lossless history transport and does not preserve original per-change timestamps.
 
 ## Update
 
