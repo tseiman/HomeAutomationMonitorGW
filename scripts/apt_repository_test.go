@@ -8,28 +8,40 @@ import (
 	"testing"
 )
 
-func TestReleaseWorkflowPublishesSignedAPTRepository(t *testing.T) {
+func TestReleaseWorkflowTriggersCentralAPTRepository(t *testing.T) {
 	root := projectRoot(t)
 	workflow, err := os.ReadFile(filepath.Join(root, ".github/workflows/release.yml"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(workflow)
+	_, dispatchJob, found := strings.Cut(text, "\n  refresh-apt-repository:\n")
+	if !found {
+		t.Fatal("central APT dispatch job not found")
+	}
 	for _, expected := range []string{
-		"APT_SIGNING_PRIVATE_KEY: ${{ secrets.APT_SIGNING_PRIVATE_KEY }}",
-		"./scripts/build_apt_repository.sh release-assets pages-site/apt stable",
-		"FBB4E68DABB4A25F6E73C81DD4EA266E8BC8043F",
-		"actions/upload-pages-artifact@v4",
-		"actions/deploy-pages@v5",
+		"needs: release",
+		"GH_TOKEN: ${{ secrets.APT_REPO_DISPATCH_TOKEN }}",
+		"gh api --method POST repos/tseiman/apt-repro/dispatches -f event_type=apt-release-published",
 	} {
-		if !strings.Contains(text, expected) {
-			t.Fatalf("release workflow lacks %q", expected)
+		if !strings.Contains(dispatchJob, expected) {
+			t.Fatalf("central APT dispatch job lacks %q", expected)
 		}
 	}
-	if strings.Contains(text, "BEGIN PGP PRIVATE KEY BLOCK") {
-		t.Fatal("release workflow contains private key material")
+	for _, obsolete := range []string{
+		"APT_SIGNING_PRIVATE_KEY",
+		"actions/upload-pages-artifact",
+		"actions/deploy-pages",
+		"BEGIN PGP PRIVATE KEY BLOCK",
+	} {
+		if strings.Contains(text, obsolete) {
+			t.Fatalf("release workflow still contains %q", obsolete)
+		}
 	}
+}
 
+func TestAPTRepositoryPublicKeyFingerprint(t *testing.T) {
+	root := projectRoot(t)
 	publicKey := filepath.Join(root, "packaging/apt/homeautomationmonitorgw-archive-key.asc")
 	output, err := exec.Command("gpg", "--batch", "--show-keys", "--with-colons", publicKey).CombinedOutput()
 	if err != nil {
