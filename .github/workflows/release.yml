@@ -92,7 +92,7 @@ jobs:
         run: ./scripts/package_release.sh "${{ matrix.arch }}" --deb
 
       - name: Upload architecture artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.arch }}
           if-no-files-found: error
@@ -126,7 +126,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Download all architecture artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
